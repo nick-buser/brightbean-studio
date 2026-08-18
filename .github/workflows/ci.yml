@@ -1,10 +1,13 @@
 name: CI
 
+# `trunk` is this fork's real branch — it is what Railway deploys, and every
+# PR we open targets it (see docs/FORK-WORKFLOW.md). Gating only `main` meant
+# the mirror branch was tested while the branch that actually ships was not.
 on:
   push:
-    branches: [main]
+    branches: [main, trunk]
   pull_request:
-    branches: [main]
+    branches: [main, trunk]
 
 # Principle of least privilege: default to read-only for every job.
 # Individual jobs can opt into more permissions if needed.
