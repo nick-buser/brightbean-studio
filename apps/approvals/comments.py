@@ -88,10 +88,17 @@ def update_comment(comment_id, user, body, *, workspace=None):
 
 
 def delete_comment(comment_id, user, workspace):
-    """Soft-delete a comment. Authors and managers can delete."""
+    """Soft-delete a comment. Authors and managers can delete.
+
+    The lookup is scoped to `workspace`, matching `update_comment` above. The
+    permission check below resolves the caller's membership in the *request*
+    workspace, so an unscoped lookup would authorise a caller against one
+    workspace while acting on a comment in another.
+    """
     comment = PostComment.objects.filter(
         id=comment_id,
         deleted_at__isnull=True,
+        post__workspace=workspace,
     ).first()
 
     if not comment:

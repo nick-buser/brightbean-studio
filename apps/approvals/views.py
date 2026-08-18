@@ -256,12 +256,16 @@ def delete_comment(request, workspace_id, post_id, comment_id):
     """Soft-delete a comment."""
     workspace = _get_workspace(request, workspace_id)
 
+    # Resolve the post before mutating, mirroring edit_comment. Looking it up
+    # afterwards meant the delete had already been committed by the time a
+    # foreign post_id raised 404.
+    post = get_object_or_404(Post, id=post_id, workspace=workspace)
+
     try:
         comment_service.delete_comment(comment_id, request.user, workspace)
     except (ValueError, PermissionError) as e:
         return HttpResponse(str(e), status=400 if isinstance(e, ValueError) else 403)
 
-    post = get_object_or_404(Post, id=post_id, workspace=workspace)
     comments = comment_service.get_comments_for_post(post, request.user)
     return render(
         request,
