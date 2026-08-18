@@ -202,6 +202,20 @@ upstream". Gate that on the disclosure decision below.
   had to be rewritten to stop competing with it. Worth flagging as real multi-agent
   friction: **re-check `git branch -vv` and the reflog before grooming infra tickets
   in a repo that another session may be touching.**
+- **CI is the only way to run the test suite from this machine.** There is no
+  Django and no venv here, and the standing disk rule forbids installing runtimes
+  or heavy dependencies without explicit per-instance approval. `ruff check` and
+  `ruff format --check` do run locally (ruff is installed standalone); `pytest` and
+  `mypy` do not. Don't go looking for a cheaper local route — there isn't one.
+  Corollary: **CI must actually cover the branch you're working on**, which is why
+  `chore/ci-gate-trunk` (PR #4) mattered more than it looked.
+- **A regression test that has never been observed failing may be vacuous.** Worth
+  proving red-before-green for anything guarding an authorisation path. On a public
+  fork that is not always free to do immediately — a public Actions log showing
+  security tests red is a reproducible exploitability demonstration against anyone
+  still unpatched, so the proof may have to wait for a disclosure window to close.
+  Budget for it rather than skipping it.
+- `.github/workflows/ci.yml` is now fork-modified (PR #4), so it joins the list below.
 - `railway.toml`, `README.md`, `.gitignore` are the known recurring conflict files
   (per FORK-WORKFLOW). No additive escape hatch for `railway.toml`; `rerere` after
   the first resolve is the mitigation.
