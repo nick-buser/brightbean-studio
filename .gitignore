@@ -134,6 +134,14 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# OAuth client secret files as downloaded from a provider console. Google's
+# download is named client_secret_<client-id>.apps.googleusercontent.com.json
+# and lands in ~/Downloads; it is easy to move into the repo root by accident,
+# and this repo's remote is public. Credentials belong in env vars / the host's
+# secret store, never in the tree.
+client_secret*.json
+*credentials*.json
+
 # Environments
 .env
 .envrc

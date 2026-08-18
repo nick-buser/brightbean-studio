@@ -1,16 +1,27 @@
-# Build config (Dockerfile) for the Railway one-click template:
-#   https://railway.com/deploy/brightbean-studio
-# The template provisions three services that share this image:
-#   - web:     Gunicorn (Dockerfile CMD), runs `python manage.py migrate` on startup
-#   - worker:  `python manage.py process_tasks`  (django-background-tasks)
-#   - Postgres
-# The web service's startup migrate fires the `post_migrate` hooks that register
-# the recurring jobs (publishing, inbox sync, retries, reminders, cleanups); the
-# worker then runs them, so scheduling works out of the box.
+# Build config (Dockerfile), shared by every service built from this repo:
+#   - web:     Gunicorn (Dockerfile CMD)
+#   - worker:  django-background-tasks
+#   - Postgres, plus a Railway Bucket for STORAGE_BACKEND=s3 media
 #
-# Wiring Railway MANUALLY from this repo instead of the template? Replicate both:
-# a worker service running `process_tasks`, and `migrate` on each deploy — the
-# Dockerfile CMD only starts Gunicorn, so neither happens on its own.
+# This file only covers [build]. The Dockerfile CMD starts Gunicorn and
+# nothing else, so each service's runtime behavior is set as a per-service
+# Railway setting (not in this shared file, since web and worker need to
+# diverge and railway.toml applies to every service that builds from this
+# repo root):
+#   - web:    Pre-Deploy Command = `python manage.py migrate --noinput`
+#             (runs in an isolated container before each deploy; fires the
+#             `post_migrate` hooks that register the recurring jobs —
+#             publishing, inbox sync, retries, reminders, cleanups)
+#   - worker: Start Command = `python manage.py process_tasks`
+# Both services also need DJANGO_SETTINGS_MODULE=config.settings.production
+# set explicitly — manage.py (unlike wsgi.py) defaults to
+# config.settings.development when that's unset.
+#
+# Railway has no cross-service ordering primitive, so on a brand-new
+# environment's first-ever deploy the worker may crash-loop for a few
+# seconds before web's migrate finishes creating tables — the existing
+# on_failure restart policy below absorbs that; it isn't an issue on any
+# later deploy since migrations are normally fast/no-op.
 
 [build]
 builder = "dockerfile"
