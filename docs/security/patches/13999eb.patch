@@ -1,0 +1,55 @@
+From 13999eb4e518593b259af222ef0589154d61e123 Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Mon, 11 May 2026 10:46:08 +0200
+Subject: [PATCH] treat empty string as empty array in json_attr (new-post
+ regression)
+
+When the composer is opened without a post_id, the view passes post=None
+and `{{ post.tags }}` renders as Django's string_if_invalid empty string.
+Without this fallback json_attr would serialize that as the JS string ""
+and Alpine would initialize tags as a string, breaking .push/.includes/
+.join in the create-post flow.
+
+Restores the prior `|default:'[]'|safe` semantics. Caught by Codex.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/common/templatetags/common_extras.py | 6 ++++--
+ apps/media_library/tests.py               | 7 +++++++
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/apps/common/templatetags/common_extras.py b/apps/common/templatetags/common_extras.py
+index bc64f2cf..05633b2a 100644
+--- a/apps/common/templatetags/common_extras.py
++++ b/apps/common/templatetags/common_extras.py
+@@ -17,8 +17,10 @@ def json_attr(value):
+     it, so Alpine still sees valid JSON.
+ 
+     Pass Python values (list/dict/None), NOT pre-serialized JSON strings.
+-    None becomes `[]` to match the prior `|default:'[]'|safe` idiom.
++    None and empty-string (Django's `string_if_invalid` fallback when a
++    template variable like `post.tags` doesn't resolve) both become `[]`,
++    matching the prior `|default:'[]'|safe` idiom.
+     """
+-    if value is None:
++    if value is None or value == "":
+         return mark_safe(escape("[]"))
+     return mark_safe(escape(json.dumps(value, ensure_ascii=False, default=str)))
+diff --git a/apps/media_library/tests.py b/apps/media_library/tests.py
+index fe93a29a..08c1fe6e 100644
+--- a/apps/media_library/tests.py
++++ b/apps/media_library/tests.py
+@@ -72,6 +72,13 @@ def test_escapes_script_payload(self):
+     def test_none_returns_empty_array_literal(self):
+         self.assertEqual(str(json_attr(None)), "[]")
+ 
++    def test_empty_string_returns_empty_array_literal(self):
++        # Django's string_if_invalid fallback for unresolved template
++        # vars (e.g. `{{ post.tags }}` when `post is None`) renders as "".
++        # That must not serialize to the JS string `""` — Alpine would
++        # initialize `tags` as a string and break .push()/.includes().
++        self.assertEqual(str(json_attr("")), "[]")
++
+     def test_dict_is_serialized(self):
+         out = str(json_attr({"a": 1, "b": "x"}))
+         self.assertIn("&quot;a&quot;: 1", out)

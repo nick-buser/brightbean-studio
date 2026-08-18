@@ -1,0 +1,52 @@
+From af0f4342898affa2a214a9ecb82ad904f63bfb4e Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Tue, 12 May 2026 10:08:28 +0200
+Subject: [PATCH] fix CI: register default FileSystemStorage on local, cast
+ resolve_public_ip return to str
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* config/settings/base.py: STORAGES["default"] is only set on the S3 branch,
+  so any test that exercises default_storage (e.g. create_asset saving an
+  uploaded file) fails on CI with InvalidStorageError. Add a
+  FileSystemStorage fallback in the existing local-storage else block.
+* apps/common/validators.py: mypy infers `addr_infos[0][4][0]` as `str | int`
+  from getaddrinfo's broad sockaddr type — wrap with str() to match the
+  declared `str | None` return.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/common/validators.py | 2 +-
+ config/settings/base.py   | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/apps/common/validators.py b/apps/common/validators.py
+index 7efa276e..9e45e321 100644
+--- a/apps/common/validators.py
++++ b/apps/common/validators.py
+@@ -70,7 +70,7 @@ def resolve_public_ip(url: str) -> str | None:
+             if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                 return None
+         # Return the first family's IP. Caller will Host-pin against it.
+-        return addr_infos[0][4][0]
++        return str(addr_infos[0][4][0])
+     except (socket.gaierror, ValueError, OSError):
+         return None
+ 
+diff --git a/config/settings/base.py b/config/settings/base.py
+index f538629b..5956ae39 100644
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@ -180,6 +180,11 @@
+         "CacheControl": "max-age=86400",
+     }
+ else:
++    # Local FS fallback so dev + test environments without S3 credentials
++    # can still call default_storage / save uploaded files.
++    STORAGES["default"] = {
++        "BACKEND": "django.core.files.storage.FileSystemStorage",
++    }
+     MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
+     MEDIA_URL = "/media/"
+ 

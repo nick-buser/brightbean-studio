@@ -1,0 +1,121 @@
+From f370b1bb9a884636e7d67b4a475c8c285b35591f Mon Sep 17 00:00:00 2001
+From: Kg <officialkgroyalty@gmail.com>
+Date: Sun, 17 May 2026 14:18:05 -0700
+Subject: [PATCH] fix: env-gated HTTPS settings + CSRF_TRUSTED_ORIGINS reader +
+ standalone-runnable prod compose
+
+- production.py: FORCE_HTTPS env toggle (default False) gates SECURE_SSL_REDIRECT,
+  HSTS, SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE. Makes plain HTTP deploy work.
+- production.py: CSRF_TRUSTED_ORIGINS now read from env (Django 4.x+ requires it
+  for POST verification on non-default ports).
+- docker-compose.prod.yml: add container_name to all services (promura-*).
+- docker-compose.prod.yml: remove caddy service. Direct app:8000 exposure for
+  IP-based deploy. Re-add Caddy when a real domain + TLS is available.
+---
+ config/settings/production.py | 26 +++++++++++++++++++-------
+ docker-compose.prod.yml       | 22 +++++-----------------
+ 2 files changed, 24 insertions(+), 24 deletions(-)
+
+diff --git a/config/settings/production.py b/config/settings/production.py
+index 8728ff31..5ac5debc 100644
+--- a/config/settings/production.py
++++ b/config/settings/production.py
+@@ -2,17 +2,29 @@
+ 
+ DEBUG = False
+ 
+-# Security
+-SECURE_SSL_REDIRECT = True
+-SECURE_HSTS_SECONDS = 31536000
+-SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+-SECURE_HSTS_PRELOAD = True
+-SESSION_COOKIE_SECURE = True
+-CSRF_COOKIE_SECURE = True
++# HTTPS toggle.
++# Default False so HTTP-only deployments (bare IP, no TLS reverse proxy)
++# don't infinite-redirect or block cookies. Flip to true once a real
++# domain + TLS-terminating proxy (Caddy/Nginx) is in front of the app.
++FORCE_HTTPS = env.bool("FORCE_HTTPS", default=False)
++
++# Security headers / redirects — all keyed off FORCE_HTTPS
++SECURE_SSL_REDIRECT = FORCE_HTTPS
++SECURE_HSTS_SECONDS = 31536000 if FORCE_HTTPS else 0
++SECURE_HSTS_INCLUDE_SUBDOMAINS = FORCE_HTTPS
++SECURE_HSTS_PRELOAD = FORCE_HTTPS
++SESSION_COOKIE_SECURE = FORCE_HTTPS
++CSRF_COOKIE_SECURE = FORCE_HTTPS
+ SECURE_CONTENT_TYPE_NOSNIFF = True
+ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+ SECURE_REDIRECT_EXEMPT = [r"^health/$"]
+ 
++# CSRF trusted origins — required by Django 4.x+ for any POST whose
++# Origin header doesn't match ALLOWED_HOSTS protocol/port. Read from
++# env so prod deploys can list the public-facing URL(s) without
++# editing this file.
++CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
++
+ # Logging
+ LOGGING = {
+     "version": 1,
+diff --git a/docker-compose.prod.yml b/docker-compose.prod.yml
+index 4b71736d..248d37cc 100644
+--- a/docker-compose.prod.yml
++++ b/docker-compose.prod.yml
+@@ -1,6 +1,7 @@
+ services:
+   migrate:
+     build: .
++    container_name: promura-migrate
+     command: python manage.py migrate --noinput
+     env_file:
+       - .env
+@@ -12,6 +13,7 @@ services:
+         condition: service_healthy
+ 
+   app:
++    container_name: promura-app
+     command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2
+     volumes:
+       - media_data:/app/media
+@@ -23,6 +25,7 @@ services:
+     restart: unless-stopped
+ 
+   worker:
++    container_name: promura-worker
+     volumes:
+       - media_data:/app/media
+     environment:
+@@ -33,10 +36,12 @@ services:
+     restart: unless-stopped
+ 
+   postgres:
++    container_name: promura-postgres
+     restart: unless-stopped
+ 
+   maintenance:
+     build: .
++    container_name: promura-maintenance
+     command: >
+       sh -c "
+       while true; do
+@@ -56,20 +61,3 @@ services:
+       migrate:
+         condition: service_completed_successfully
+     restart: unless-stopped
+-
+-  caddy:
+-    image: caddy:2-alpine
+-    ports:
+-      - "80:80"
+-      - "443:443"
+-    volumes:
+-      - ./Caddyfile:/etc/caddy/Caddyfile
+-      - caddy_data:/data
+-      - caddy_config:/config
+-    depends_on:
+-      - app
+-    restart: unless-stopped
+-
+-volumes:
+-  caddy_data:
+-  caddy_config:

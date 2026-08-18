@@ -1,0 +1,100 @@
+From af89c2f6055934fba134471ef3c88c7b34ed2576 Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Tue, 12 May 2026 10:49:17 +0200
+Subject: [PATCH] fix: scope strict org-role check to admin/owner tier only
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Codex flagged that the new requested_org_level >= inviter_org_level check
+broke the client-portal flow: invite_client (apps/client_portal/views_admin.py)
+is gated by @require_workspace_role("manager") not @require_org_role, so any
+workspace manager who is only org-role=member can invoke it. That view calls
+create_invitation with org_role=MEMBER. After the strict check landed, the
+service rejected (member >= member) before the workspace-role assignment
+could even be evaluated.
+
+The audit intent was "no lateral admin grants" — peer member-to-member
+invites were never the threat model (and they're gated by view-layer
+@require_* decorators anyway). Restrict the strict check to the admin/owner
+tier so member-tier invites pass through. Mirror the same loosening in
+update_member_org_role for consistency.
+
+Test: ClientPortalManagerInviteTests.test_workspace_manager_can_invite_client
+verifies the regression. All other hierarchy tests (admin-cannot-invite-as-
+admin, admin-cannot-promote-member-to-admin, etc.) still pass — the only
+loosening is at the member tier.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/members/services.py                  | 18 +++++++++++-------
+ apps/members/tests/test_role_hierarchy.py | 23 +++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/apps/members/services.py b/apps/members/services.py
+index 9c422937..5f8f651c 100644
+--- a/apps/members/services.py
++++ b/apps/members/services.py
+@@ -99,11 +99,14 @@ def create_invitation(org, email, org_role, workspace_assignments, invited_by, *
+     requested_org_level = ORG_ROLE_LEVEL.get(org_role, 0)
+     if requested_org_level == 0:
+         raise ValueError(f"Unknown org role: {org_role!r}.")
+-    # Strict inequality on org-role: only owners can grant admin, only admins
+-    # can grant member. Blocks lateral admin grants that would let a
+-    # compromised admin (eg. via XSS) clone their privileges to an attacker.
+-    if requested_org_level >= inviter_org_level:
+-        raise ValueError("You cannot invite someone to an organization role at or above your own.")
++    # Strict inequality on org-role, but ONLY for the admin/owner tier:
++    # blocks lateral admin grants (a compromised admin shouldn't be able to
++    # clone their privileges) while still permitting member-tier invites —
++    # which the workspace-manager → client-invite flow relies on, since
++    # those managers are themselves only org-role=member.
++    admin_level = ORG_ROLE_LEVEL[OrgMembership.OrgRole.ADMIN]
++    if requested_org_level >= admin_level and requested_org_level >= inviter_org_level:
++        raise ValueError("Only organization owners can invite someone as an admin.")
+ 
+     # Validate workspace assignments belong to org AND don't exceed inviter's
+     # workspace role in that specific workspace.
+@@ -271,8 +274,9 @@ def update_member_org_role(org, membership, new_role, *, caller=None):
+         existing_level = ORG_ROLE_LEVEL.get(membership.org_role, 0)
+         if caller_level < existing_level:
+             raise ValueError("You cannot change a member whose role is higher than your own.")
+-        if caller_level <= new_level:
+-            raise ValueError("You cannot assign a role at or above your own.")
++        admin_level = ORG_ROLE_LEVEL[OrgMembership.OrgRole.ADMIN]
++        if new_level >= admin_level and new_level >= caller_level:
++            raise ValueError("Only organization owners can promote someone to admin.")
+ 
+     if membership.org_role == OrgMembership.OrgRole.OWNER:
+         owner_count = OrgMembership.objects.filter(organization=org, org_role=OrgMembership.OrgRole.OWNER).count()
+diff --git a/apps/members/tests/test_role_hierarchy.py b/apps/members/tests/test_role_hierarchy.py
+index f590aba5..8e095d8a 100644
+--- a/apps/members/tests/test_role_hierarchy.py
++++ b/apps/members/tests/test_role_hierarchy.py
+@@ -231,3 +231,26 @@ def test_admin_who_is_also_owner_can_change_owner_to_viewer(self):
+         self.assertLess(response.status_code, 400)
+         self.victim_ws_membership.refresh_from_db()
+         self.assertEqual(self.victim_ws_membership.workspace_role, "viewer")
++
++
++class ClientPortalManagerInviteTests(TestCase):
++    """POST /workspace/<id>/settings/clients/invite/ — a workspace manager who
++    is only org-role=member must still be able to invite clients (org_role=member).
++    Regression for the Codex P1 finding."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="WS")
++        self.manager = _make_user("manager@example.com")
++        OrgMembership.objects.create(user=self.manager, organization=self.org, org_role="member")
++        WorkspaceMembership.objects.create(user=self.manager, workspace=self.workspace, workspace_role="manager")
++
++    def test_workspace_manager_can_invite_client(self):
++        _login(self.client, self.manager)
++        url = reverse("client_portal_admin:invite_client", kwargs={"workspace_id": self.workspace.id})
++        response = self.client.post(url, data={"email": "newclient@example.com"})
++        # 200 (HTMX) or 302 (regular redirect) both indicate success.
++        self.assertLess(response.status_code, 400)
++        from apps.members.models import Invitation
++
++        self.assertTrue(Invitation.objects.filter(email="newclient@example.com").exists())

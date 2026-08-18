@@ -1,0 +1,363 @@
+From 4d5a15617f2ff75cb56e2b4666cf7176b12e33a7 Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Mon, 11 May 2026 10:21:48 +0200
+Subject: [PATCH] fix stored XSS in media/composer tag inputs (Alpine x-data)
+
+User-supplied tag JSON was rendered into Alpine x-data attributes with
+|safe, letting an authenticated user break out of the attribute and
+execute scripts on any viewer of the asset/composer/CSV-mapping pages.
+
+Add an apps.common json_attr template filter that HTML-escapes the
+serialized JSON, and apply it at all three attribute-context call sites.
+Harden the two media-tag write endpoints with a _normalize_tags helper
+(max 25 tags x 100 chars, list-of-string validation, 400 on bad input).
+Tag string content is intentionally not stripped server-side -- the
+render-time escape is the security boundary.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/common/apps.py                          |   7 ++
+ apps/common/templatetags/__init__.py         |   0
+ apps/common/templatetags/common_extras.py    |  24 +++++
+ apps/composer/views.py                       |   3 -
+ apps/media_library/tests.py                  | 104 ++++++++++++++++++-
+ apps/media_library/views.py                  |  55 ++++++++--
+ config/settings/base.py                      |   1 +
+ templates/composer/compose.html              |   3 +-
+ templates/composer/partials/csv_mapping.html |   3 +-
+ templates/media_library/_tag_input.html      |   3 +-
+ 10 files changed, 185 insertions(+), 18 deletions(-)
+ create mode 100644 apps/common/apps.py
+ create mode 100644 apps/common/templatetags/__init__.py
+ create mode 100644 apps/common/templatetags/common_extras.py
+
+diff --git a/apps/common/apps.py b/apps/common/apps.py
+new file mode 100644
+index 00000000..8e8c52aa
+--- /dev/null
++++ b/apps/common/apps.py
+@@ -0,0 +1,7 @@
++from django.apps import AppConfig
++
++
++class CommonConfig(AppConfig):
++    default_auto_field = "django.db.models.BigAutoField"
++    name = "apps.common"
++    verbose_name = "Common"
+diff --git a/apps/common/templatetags/__init__.py b/apps/common/templatetags/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apps/common/templatetags/common_extras.py b/apps/common/templatetags/common_extras.py
+new file mode 100644
+index 00000000..bc64f2cf
+--- /dev/null
++++ b/apps/common/templatetags/common_extras.py
+@@ -0,0 +1,24 @@
++import json
++
++from django import template
++from django.utils.html import escape
++from django.utils.safestring import mark_safe
++
++register = template.Library()
++
++
++@register.filter(is_safe=True)
++def json_attr(value):
++    """Serialize a Python value as a JSON literal safe to embed inside an
++    HTML attribute (e.g. Alpine.js x-data).
++
++    json.dumps produces JSON, then HTML-escape covers &, <, >, ", '. The
++    browser HTML-decodes the attribute value before the JS engine parses
++    it, so Alpine still sees valid JSON.
++
++    Pass Python values (list/dict/None), NOT pre-serialized JSON strings.
++    None becomes `[]` to match the prior `|default:'[]'|safe` idiom.
++    """
++    if value is None:
++        return mark_safe(escape("[]"))
++    return mark_safe(escape(json.dumps(value, ensure_ascii=False, default=str)))
+diff --git a/apps/composer/views.py b/apps/composer/views.py
+index d4fddf42..7950dce8 100644
+--- a/apps/composer/views.py
++++ b/apps/composer/views.py
+@@ -2351,8 +2351,6 @@ def csv_upload(request, workspace_id):
+             "filename": csv_file.name,
+         }
+ 
+-        import json as json_mod
+-
+         return render(
+             request,
+             "composer/partials/csv_mapping.html",
+@@ -2361,7 +2359,6 @@ def csv_upload(request, workspace_id):
+                 "headers": headers,
+                 "preview_rows": preview_rows,
+                 "auto_mapping": auto_mapping,
+-                "auto_mapping_json": json_mod.dumps(auto_mapping),
+                 "field_choices": list(field_map.keys()),
+             },
+         )
+diff --git a/apps/media_library/tests.py b/apps/media_library/tests.py
+index 3061d4ad..5f79686b 100644
+--- a/apps/media_library/tests.py
++++ b/apps/media_library/tests.py
+@@ -1,8 +1,18 @@
+ """Tests for the Media Library app."""
+ 
+-from django.test import TestCase
++import re
++import uuid
+ 
++from django.template.loader import render_to_string
++from django.test import SimpleTestCase, TestCase
++
++from apps.common.templatetags.common_extras import json_attr
+ from apps.media_library.models import MediaAsset
++from apps.media_library.views import (
++    MAX_TAG_LENGTH,
++    MAX_TAGS_PER_ASSET,
++    _normalize_tags,
++)
+ 
+ 
+ class MediaAssetModelTest(TestCase):
+@@ -47,3 +57,95 @@ def test_str_representation(self):
+         asset = MediaAsset()
+         asset.filename = "photo.jpg"
+         self.assertEqual(str(asset), "photo.jpg")
++
++
++class JsonAttrFilterTest(SimpleTestCase):
++    """Test the json_attr template filter (attribute-context XSS guard)."""
++
++    def test_escapes_script_payload(self):
++        out = str(json_attr(['<script>alert(1)</script>', '"><img src=x>']))
++        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", out)
++        self.assertIn("&quot;", out)
++        self.assertNotIn("<script>", out)
++        self.assertNotIn("<img", out)
++
++    def test_none_returns_empty_array_literal(self):
++        self.assertEqual(str(json_attr(None)), "[]")
++
++    def test_dict_is_serialized(self):
++        out = str(json_attr({"a": 1, "b": "x"}))
++        self.assertIn("&quot;a&quot;: 1", out)
++        self.assertIn("&quot;b&quot;: &quot;x&quot;", out)
++        self.assertNotIn('"a"', out)
++
++
++class _StubAsset:
++    def __init__(self, asset_id, tags, is_shared=False):
++        self.id = asset_id
++        self.tags = tags
++        self.is_shared = is_shared
++
++
++class _StubWorkspace:
++    def __init__(self, workspace_id):
++        self.id = workspace_id
++
++
++class TagInputTemplateTest(SimpleTestCase):
++    """Regression: malicious tag content must not break out of the x-data attribute."""
++
++    def _render(self, tags):
++        return render_to_string(
++            "media_library/_tag_input.html",
++            {
++                "asset": _StubAsset(uuid.uuid4(), tags),
++                "workspace": _StubWorkspace(uuid.uuid4()),
++                "is_shared_library": False,
++                "is_admin": False,
++            },
++        )
++
++    def test_malicious_tag_is_escaped_in_x_data(self):
++        rendered = self._render(['"><script>alert(1)</script>'])
++        match = re.search(r'x-data="tagInput\(([^"]*)\)"', rendered)
++        self.assertIsNotNone(match, "x-data attribute should still be quoted with \"")
++        attr_body = match.group(1)
++        self.assertIn("&lt;script&gt;", attr_body)
++        self.assertIn("&quot;", attr_body)
++        self.assertNotIn("<script>", attr_body)
++        self.assertNotIn('"><script>', rendered)
++
++    def test_empty_tags_renders_array_literal(self):
++        rendered = self._render([])
++        self.assertIn('x-data="tagInput([])"', rendered)
++
++
++class NormalizeTagsTest(SimpleTestCase):
++    """Validation contract for the tag-write endpoints."""
++
++    def test_rejects_non_list(self):
++        with self.assertRaises(ValueError):
++            _normalize_tags({"foo": "bar"})
++
++    def test_rejects_too_many(self):
++        with self.assertRaises(ValueError):
++            _normalize_tags(["x"] * (MAX_TAGS_PER_ASSET + 1))
++
++    def test_accepts_at_limit(self):
++        result = _normalize_tags([f"tag{i}" for i in range(MAX_TAGS_PER_ASSET)])
++        self.assertEqual(len(result), MAX_TAGS_PER_ASSET)
++
++    def test_rejects_oversized(self):
++        with self.assertRaises(ValueError):
++            _normalize_tags(["x" * (MAX_TAG_LENGTH + 1)])
++
++    def test_rejects_non_string_element(self):
++        with self.assertRaises(ValueError):
++            _normalize_tags([123])
++
++    def test_strips_whitespace_and_dedupes(self):
++        self.assertEqual(_normalize_tags(["  a  ", "a", "b", "", "   "]), ["a", "b"])
++
++    def test_preserves_malicious_payload_verbatim(self):
++        payload = "<script>alert(1)</script>"
++        self.assertEqual(_normalize_tags([payload]), [payload])
+diff --git a/apps/media_library/views.py b/apps/media_library/views.py
+index 838520e0..4c1d09ef 100644
+--- a/apps/media_library/views.py
++++ b/apps/media_library/views.py
+@@ -32,6 +32,36 @@ def _get_workspace_or_404(request, workspace_id):
+     return request.workspace
+ 
+ 
++MAX_TAGS_PER_ASSET = 25
++MAX_TAG_LENGTH = 100
++
++
++def _normalize_tags(raw) -> list[str]:
++    """Validate and normalize a tag list from request input.
++
++    Raises ValueError on malformed input — caller should return HTTP 400.
++    """
++    if not isinstance(raw, list):
++        raise ValueError("tags must be a list")
++    if len(raw) > MAX_TAGS_PER_ASSET:
++        raise ValueError(f"too many tags (max {MAX_TAGS_PER_ASSET})")
++    out: list[str] = []
++    seen: set[str] = set()
++    for t in raw:
++        if not isinstance(t, str):
++            raise ValueError("each tag must be a string")
++        t = t.strip()
++        if not t:
++            continue
++        if len(t) > MAX_TAG_LENGTH:
++            raise ValueError(f"tag too long (max {MAX_TAG_LENGTH} chars)")
++        if t in seen:
++            continue
++        seen.add(t)
++        out.append(t)
++    return out
++
++
+ # ──────────────────────────────────────────────────────────────
+ #  Library Index
+ # ──────────────────────────────────────────────────────────────
+@@ -396,12 +426,13 @@ def asset_update_tags(request, workspace_id, asset_id):
+     )
+ 
+     try:
+-        tags = json.loads(request.body) if request.content_type == "application/json" else request.POST.getlist("tags")
+-    except (json.JSONDecodeError, ValueError):
+-        tags = request.POST.getlist("tags")
+-
+-    # Sanitize tags
+-    asset.tags = [t.strip() for t in tags if t.strip()]
++        if request.content_type == "application/json":
++            body = json.loads(request.body)
++        else:
++            body = request.POST.getlist("tags")
++        asset.tags = _normalize_tags(body)
++    except (json.JSONDecodeError, ValueError) as e:
++        return JsonResponse({"error": str(e)}, status=400)
+     asset.save(update_fields=["tags", "updated_at"])
+ 
+     if request.htmx:
+@@ -1060,11 +1091,13 @@ def shared_asset_update_tags(request, asset_id):
+     asset = get_object_or_404(MediaAsset.objects.shared_only(org.id), pk=asset_id)
+ 
+     try:
+-        tags = json.loads(request.body) if request.content_type == "application/json" else request.POST.getlist("tags")
+-    except (json.JSONDecodeError, ValueError):
+-        tags = request.POST.getlist("tags")
+-
+-    asset.tags = [t.strip() for t in tags if t.strip()]
++        if request.content_type == "application/json":
++            body = json.loads(request.body)
++        else:
++            body = request.POST.getlist("tags")
++        asset.tags = _normalize_tags(body)
++    except (json.JSONDecodeError, ValueError) as e:
++        return JsonResponse({"error": str(e)}, status=400)
+     asset.save(update_fields=["tags", "updated_at"])
+ 
+     if request.htmx:
+diff --git a/config/settings/base.py b/config/settings/base.py
+index bae82647..f538629b 100644
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@ -47,6 +47,7 @@
+ ]
+ 
+ LOCAL_APPS = [
++    "apps.common",
+     "apps.accounts",
+     "apps.organizations",
+     "apps.workspaces",
+diff --git a/templates/composer/compose.html b/templates/composer/compose.html
+index ec51ff85..37fb053b 100644
+--- a/templates/composer/compose.html
++++ b/templates/composer/compose.html
+@@ -1,5 +1,6 @@
+ {% extends "base.html" %}
+ {% load static %}
++{% load common_extras %}
+ 
+ {% block title %}{% if is_edit %}Edit Post{% else %}New Post{% endif %} - {{ workspace.name }} - Brightbean{% endblock %}
+ 
+@@ -769,7 +770,7 @@ <h1 class="text-base font-semibold text-stone-900" style="letter-spacing: -0.01e
+ 
+                 <!-- Tags (dropdown with search & create) -->
+                 <div class="relative" x-data="{
+-                    tags: {{ post.tags|default:'[]'|safe }},
++                    tags: {{ post.tags|json_attr }},
+                     tagDropdownOpen: false,
+                     tagSearch: '',
+                     allTags: [{% for tag in all_tags %}'{{ tag.name|escapejs }}'{% if not forloop.last %},{% endif %}{% endfor %}],
+diff --git a/templates/composer/partials/csv_mapping.html b/templates/composer/partials/csv_mapping.html
+index 968a0ff0..af3897a1 100644
+--- a/templates/composer/partials/csv_mapping.html
++++ b/templates/composer/partials/csv_mapping.html
+@@ -1,3 +1,4 @@
++{% load common_extras %}
+ <!-- Step 2: Column Mapping (loaded via HTMX after upload) -->
+ <div class="space-y-6">
+     <div class="bg-white rounded-xl border border-stone-200 p-6">
+@@ -37,7 +38,7 @@ <h2 class="text-sm font-semibold text-stone-800">Map Columns</h2>
+ 
+             <!-- Map by field: one select per post field -->
+             <div class="grid grid-cols-2 sm:grid-cols-4 gap-3"
+-                 x-data="{ autoMapping: {{ auto_mapping_json|default:'{}' }} }"
++                 x-data="{ autoMapping: {{ auto_mapping|json_attr }} }"
+                  x-init="$nextTick(() => {
+                      Object.entries(autoMapping).forEach(([field, colIdx]) => {
+                          const sel = $el.querySelector(`[name='map_${field}']`);
+diff --git a/templates/media_library/_tag_input.html b/templates/media_library/_tag_input.html
+index 5d362c0e..0924aa59 100644
+--- a/templates/media_library/_tag_input.html
++++ b/templates/media_library/_tag_input.html
+@@ -1,6 +1,7 @@
++{% load common_extras %}
+ {% comment %}Tag editor with autocomplete. Expects: asset, workspace, is_shared_library, is_admin{% endcomment %}
+ 
+-<div x-data="tagInput({{ asset.tags|safe }})" class="space-y-2">
++<div x-data="tagInput({{ asset.tags|json_attr }})" class="space-y-2">
+   <!-- Current tags -->
+   <div class="flex flex-wrap gap-1.5">
+     <template x-for="(tag, i) in tags" :key="i">
