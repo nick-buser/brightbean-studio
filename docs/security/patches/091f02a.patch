@@ -1,0 +1,1564 @@
+From 091f02a7eac3a09160c7991372efcb0212d74ed3 Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Tue, 12 May 2026 10:04:11 +0200
+Subject: [PATCH] fix audit findings: RBAC hierarchy, color CSS injection, SVG
+ XSS, MIME spoof, SSRF, IDOR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-on security audit triggered by the externally reported stored XSS
+that pivoted to /members/invite/. The XSS sink itself was already fixed in
+prior commits; this batch closes the rest of the surface so an attacker who
+ever gets a similar foothold has nowhere to escalate.
+
+* members: enforce role-hierarchy on invite + workspace assignments +
+  update_member_role — strict on org_role (only owners can grant admin),
+  non-strict on workspace_role bounded by inviter's own role in that
+  workspace (org owners bypass via implicit ws-owner).
+* calendar: validate hex colors at view + model layers, gate
+  event_create/edit/delete behind create_posts permission (viewers were
+  able to create CSS-injectable shared events), scope queue_create
+  category_id to the request workspace.
+* media_library: drop image/svg+xml from the allow-list (script-bearing
+  SVG executed same-origin on local storage) and replace
+  content_type-based validation with a magic-byte sniffer so a
+  spoofed-Content-Type masquerade is rejected before storage.
+* composer feeds: re-validate every periodic fetch through is_safe_url +
+  reject redirects to private IPs (was follow_redirects=True with no
+  per-hop check, opening DNS-rebind / 302->internal).
+* notifications: re-validate webhook URL at dispatch time, refuse 3xx
+  redirect responses (no more 302->127.0.0.1).
+* inbox/webhooks + composer feeds: route XML through safe_xml_fromstring
+  (5 MB cap + DOCTYPE/ENTITY rejection) to close the billion-laughs DoS.
+* approvals: scope edit_comment's Post lookup + comment query to the
+  request workspace so a viewer in WS-A cannot edit/leak comments on a
+  post in WS-B by guessing the UUIDs.
+
+No new dependencies — defusedxml and python-magic both intentionally
+avoided to keep the buildpack lean; the size-cap + DOCTYPE/ENTITY
+prefix-scan and the hand-rolled magic-byte table cover the same threats.
+
+Tests: +30 (325 total passing). Migrations: 3 (validator-only on
+workspaces, calendar, composer color fields).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/approvals/comments.py                    |  16 +-
+ apps/approvals/tests_security.py              |  85 +++++++++
+ apps/approvals/views.py                       |  11 +-
+ .../0005_alter_customcalendarevent_color.py   |  24 +++
+ apps/calendar/models.py                       |   2 +
+ apps/calendar/tests_security.py               | 164 ++++++++++++++++++
+ apps/calendar/views.py                        |  21 ++-
+ apps/common/tests/test_validators.py          | 104 +++++++++++
+ .../0016_alter_contentcategory_color.py       |  24 +++
+ apps/composer/models.py                       |   2 +
+ apps/composer/views.py                        |  87 ++++++----
+ apps/inbox/webhooks.py                        |   9 +-
+ apps/media_library/services.py                |  15 +-
+ apps/media_library/tests/test_security.py     |  92 ++++++++++
+ apps/media_library/validators.py              |  74 +++++++-
+ apps/members/services.py                      | 106 ++++++++++-
+ apps/members/tests/__init__.py                |   0
+ apps/members/tests/test_role_hierarchy.py     | 163 +++++++++++++++++
+ apps/members/views.py                         |   5 +-
+ apps/notifications/engine.py                  |  18 +-
+ ..._alter_workspace_primary_color_and_more.py |  28 +++
+ apps/workspaces/models.py                     |   5 +-
+ 22 files changed, 980 insertions(+), 75 deletions(-)
+ create mode 100644 apps/approvals/tests_security.py
+ create mode 100644 apps/calendar/migrations/0005_alter_customcalendarevent_color.py
+ create mode 100644 apps/calendar/tests_security.py
+ create mode 100644 apps/composer/migrations/0016_alter_contentcategory_color.py
+ create mode 100644 apps/media_library/tests/test_security.py
+ create mode 100644 apps/members/tests/__init__.py
+ create mode 100644 apps/members/tests/test_role_hierarchy.py
+ create mode 100644 apps/workspaces/migrations/0003_alter_workspace_primary_color_and_more.py
+
+diff --git a/apps/approvals/comments.py b/apps/approvals/comments.py
+index 3990fcfc..85463e59 100644
+--- a/apps/approvals/comments.py
++++ b/apps/approvals/comments.py
+@@ -62,12 +62,20 @@ def create_comment(post, author, body, visibility, parent_id=None, attachment=No
+     return comment
+ 
+ 
+-def update_comment(comment_id, user, body):
+-    """Update a comment's body. Only the author can edit."""
+-    comment = PostComment.objects.filter(
++def update_comment(comment_id, user, body, *, workspace=None):
++    """Update a comment's body. Only the author can edit.
++
++    When `workspace` is provided, the comment's post is required to belong to
++    that workspace — defends against cross-workspace IDOR via a forged
++    post_id/comment_id pair.
++    """
++    qs = PostComment.objects.filter(
+         id=comment_id,
+         deleted_at__isnull=True,
+-    ).first()
++    )
++    if workspace is not None:
++        qs = qs.filter(post__workspace=workspace)
++    comment = qs.first()
+ 
+     if not comment:
+         raise ValueError("Comment not found.")
+diff --git a/apps/approvals/tests_security.py b/apps/approvals/tests_security.py
+new file mode 100644
+index 00000000..213cf1b2
+--- /dev/null
++++ b/apps/approvals/tests_security.py
+@@ -0,0 +1,85 @@
++"""Security regression tests for approvals comments (V9)."""
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.approvals.models import PostComment
++from apps.composer.models import Post
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.workspaces.models import Workspace
++
++
++def _make_user(email):
++    user = User.objects.create_user(
++        email=email,
++        password="testpass123",
++        tos_accepted_at=timezone.now(),
++    )
++    # The accounts post_save signal auto-provisions a default Organization +
++    # Workspace + OrgMembership for every new User. Tests that want to attach
++    # the user to a specific org must start from a clean slate, otherwise the
++    # RBAC middleware (which does OrgMembership.objects.filter(...).first())
++    # may pick the auto-org instead of the test org.
++    from apps.members.models import OrgMembership, WorkspaceMembership
++    from apps.organizations.models import Organization
++
++    auto_org_ids = list(OrgMembership.objects.filter(user=user).values_list("organization_id", flat=True))
++    WorkspaceMembership.objects.filter(user=user).delete()
++    OrgMembership.objects.filter(user=user).delete()
++    Organization.objects.filter(id__in=auto_org_ids).delete()
++    return user
++
++
++class EditCommentWorkspaceScopeTests(TestCase):
++    """V9: edit_comment must reject cross-workspace post_id."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.ws_a = Workspace.objects.create(organization=self.org, name="WS-A")
++        self.ws_b = Workspace.objects.create(organization=self.org, name="WS-B")
++        self.user = _make_user("user@example.com")
++        OrgMembership.objects.create(user=self.user, organization=self.org, org_role="owner")
++        WorkspaceMembership.objects.create(user=self.user, workspace=self.ws_a, workspace_role="editor")
++        WorkspaceMembership.objects.create(user=self.user, workspace=self.ws_b, workspace_role="editor")
++
++        self.post_b = Post.objects.create(workspace=self.ws_b, author=self.user, caption="b")
++        self.comment = PostComment.objects.create(
++            post=self.post_b,
++            author=self.user,
++            body="hi",
++            visibility=PostComment.Visibility.INTERNAL,
++        )
++
++    def test_cross_workspace_edit_returns_404(self):
++        self.client.force_login(self.user)
++        # Edit a comment that lives in WS-B, but POST through WS-A's URL.
++        url = reverse(
++            "approvals:edit_comment",
++            kwargs={
++                "workspace_id": self.ws_a.id,
++                "post_id": self.post_b.id,
++                "comment_id": self.comment.id,
++            },
++        )
++        response = self.client.post(url, data={"body": "rewritten"})
++        self.assertEqual(response.status_code, 404)
++        self.comment.refresh_from_db()
++        self.assertEqual(self.comment.body, "hi")
++
++    def test_same_workspace_edit_succeeds(self):
++        self.client.force_login(self.user)
++        url = reverse(
++            "approvals:edit_comment",
++            kwargs={
++                "workspace_id": self.ws_b.id,
++                "post_id": self.post_b.id,
++                "comment_id": self.comment.id,
++            },
++        )
++        response = self.client.post(url, data={"body": "rewritten"})
++        self.assertLess(response.status_code, 400)
++        self.comment.refresh_from_db()
++        self.assertEqual(self.comment.body, "rewritten")
+diff --git a/apps/approvals/views.py b/apps/approvals/views.py
+index c93261a5..545f0145 100644
+--- a/apps/approvals/views.py
++++ b/apps/approvals/views.py
+@@ -315,18 +315,21 @@ def add_comment(request, workspace_id, post_id):
+ @require_POST
+ def edit_comment(request, workspace_id, post_id, comment_id):
+     """Edit a comment."""
+-    _get_workspace(request, workspace_id)
++    workspace = _get_workspace(request, workspace_id)
+     body = request.POST.get("body", "").strip()
+ 
+     if not body:
+         return HttpResponse("Comment body is required.", status=400)
+ 
++    # Scope the post + comment lookup to the request workspace so a viewer
++    # cannot edit / surface comments belonging to a different workspace.
++    post = get_object_or_404(Post, id=post_id, workspace=workspace)
++
+     try:
+-        comment_service.update_comment(comment_id, request.user, body)
++        comment_service.update_comment(comment_id, request.user, body, workspace=workspace)
+     except (ValueError, PermissionError) as e:
+         return HttpResponse(str(e), status=400 if isinstance(e, ValueError) else 403)
+ 
+-    post = get_object_or_404(Post, id=post_id)
+     comments = comment_service.get_comments_for_post(post, request.user)
+     return render(
+         request,
+@@ -334,7 +337,7 @@ def edit_comment(request, workspace_id, post_id, comment_id):
+         {
+             "comments": comments,
+             "post": post,
+-            "workspace": post.workspace,
++            "workspace": workspace,
+         },
+     )
+ 
+diff --git a/apps/calendar/migrations/0005_alter_customcalendarevent_color.py b/apps/calendar/migrations/0005_alter_customcalendarevent_color.py
+new file mode 100644
+index 00000000..cf328b4d
+--- /dev/null
++++ b/apps/calendar/migrations/0005_alter_customcalendarevent_color.py
+@@ -0,0 +1,24 @@
++# Generated by Django 5.1.15 on 2026-05-12 07:14
++
++from django.db import migrations, models
++
++import apps.common.validators
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("calendar", "0004_queue_category_queue_social_account_queue_workspace_and_more"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="customcalendarevent",
++            name="color",
++            field=models.CharField(
++                default="#3B82F6",
++                help_text="Hex color for the event bar.",
++                max_length=7,
++                validators=[apps.common.validators.validate_hex_color],
++            ),
++        ),
++    ]
+diff --git a/apps/calendar/models.py b/apps/calendar/models.py
+index 35dfdeb2..4deb9ccd 100644
+--- a/apps/calendar/models.py
++++ b/apps/calendar/models.py
+@@ -6,6 +6,7 @@
+ from django.db import models
+ 
+ from apps.common.managers import WorkspaceScopedManager
++from apps.common.validators import validate_hex_color
+ 
+ 
+ class PostingSlot(models.Model):
+@@ -188,6 +189,7 @@ class CustomCalendarEvent(models.Model):
+         max_length=7,
+         default="#3B82F6",
+         help_text="Hex color for the event bar.",
++        validators=[validate_hex_color],
+     )
+     created_by = models.ForeignKey(
+         settings.AUTH_USER_MODEL,
+diff --git a/apps/calendar/tests_security.py b/apps/calendar/tests_security.py
+new file mode 100644
+index 00000000..26ddfbe3
+--- /dev/null
++++ b/apps/calendar/tests_security.py
+@@ -0,0 +1,164 @@
++"""Security regression tests for the May-2026 audit.
++
++Covers V2 (hex-color CSS injection), V6 (queue category IDOR), and V7
++(missing role check on custom calendar events).
++"""
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.calendar.models import CustomCalendarEvent, Queue
++from apps.composer.models import ContentCategory
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.social_accounts.models import SocialAccount
++from apps.workspaces.models import Workspace
++
++
++def _make_user(email):
++    user = User.objects.create_user(
++        email=email,
++        password="testpass123",
++        tos_accepted_at=timezone.now(),
++    )
++    # The accounts post_save signal auto-provisions a default Organization +
++    # Workspace + OrgMembership for every new User. Tests that want to attach
++    # the user to a specific org must start from a clean slate, otherwise the
++    # RBAC middleware (which does OrgMembership.objects.filter(...).first())
++    # may pick the auto-org instead of the test org.
++    from apps.members.models import OrgMembership, WorkspaceMembership
++    from apps.organizations.models import Organization
++
++    auto_org_ids = list(OrgMembership.objects.filter(user=user).values_list("organization_id", flat=True))
++    WorkspaceMembership.objects.filter(user=user).delete()
++    OrgMembership.objects.filter(user=user).delete()
++    Organization.objects.filter(id__in=auto_org_ids).delete()
++    return user
++
++
++class CalendarEventColorValidationTests(TestCase):
++    """V2 + V7: event create/edit require role and reject non-hex colors."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="WS")
++        self.owner = _make_user("owner@example.com")
++        OrgMembership.objects.create(user=self.owner, organization=self.org, org_role="owner")
++        WorkspaceMembership.objects.create(user=self.owner, workspace=self.workspace, workspace_role="owner")
++        self.viewer = _make_user("viewer@example.com")
++        OrgMembership.objects.create(user=self.viewer, organization=self.org, org_role="member")
++        WorkspaceMembership.objects.create(user=self.viewer, workspace=self.workspace, workspace_role="viewer")
++
++    def test_viewer_cannot_create_event(self):
++        self.client.force_login(self.viewer)
++        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
++        response = self.client.post(
++            url,
++            data={
++                "title": "Launch",
++                "start_date": "2026-06-01",
++                "end_date": "2026-06-01",
++                "color": "#FF0000",
++            },
++        )
++        self.assertEqual(response.status_code, 403)
++        self.assertFalse(CustomCalendarEvent.objects.exists())
++
++    def test_owner_with_bad_color_is_rejected(self):
++        self.client.force_login(self.owner)
++        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
++        response = self.client.post(
++            url,
++            data={
++                "title": "Launch",
++                "start_date": "2026-06-01",
++                "end_date": "2026-06-01",
++                "color": "red;background-image:url('//evil')",
++            },
++        )
++        self.assertEqual(response.status_code, 400)
++        self.assertFalse(CustomCalendarEvent.objects.exists())
++
++    def test_owner_with_good_color_succeeds(self):
++        self.client.force_login(self.owner)
++        url = reverse("calendar:event_create", kwargs={"workspace_id": self.workspace.id})
++        response = self.client.post(
++            url,
++            data={
++                "title": "Launch",
++                "start_date": "2026-06-01",
++                "end_date": "2026-06-01",
++                "color": "#FF0000",
++            },
++        )
++        self.assertLess(response.status_code, 400)
++        self.assertEqual(CustomCalendarEvent.objects.count(), 1)
++
++    def test_event_edit_rejects_bad_color(self):
++        event = CustomCalendarEvent.objects.create(
++            workspace=self.workspace,
++            title="Existing",
++            start_date="2026-06-01",
++            end_date="2026-06-01",
++            color="#3B82F6",
++            created_by=self.owner,
++        )
++        self.client.force_login(self.owner)
++        url = reverse(
++            "calendar:event_edit",
++            kwargs={"workspace_id": self.workspace.id, "event_id": event.id},
++        )
++        response = self.client.post(url, data={"color": "red;url(x)"})
++        self.assertEqual(response.status_code, 400)
++        event.refresh_from_db()
++        self.assertEqual(event.color, "#3B82F6")
++
++
++class QueueCreateCategoryIdorTests(TestCase):
++    """V6: queue_create must validate category_id against the request workspace."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.ws_a = Workspace.objects.create(organization=self.org, name="WS-A")
++        self.ws_b = Workspace.objects.create(organization=self.org, name="WS-B")
++        self.user = _make_user("user@example.com")
++        OrgMembership.objects.create(user=self.user, organization=self.org, org_role="owner")
++        WorkspaceMembership.objects.create(user=self.user, workspace=self.ws_a, workspace_role="owner")
++        WorkspaceMembership.objects.create(user=self.user, workspace=self.ws_b, workspace_role="owner")
++        self.account = SocialAccount.objects.create(
++            workspace=self.ws_a,
++            platform="bluesky",
++            account_name="bsky",
++            account_platform_id="did:plc:test",
++            connection_status="connected",
++        )
++        self.foreign_category = ContentCategory.objects.create(workspace=self.ws_b, name="Foreign", color="#000000")
++
++    def test_foreign_category_id_returns_404(self):
++        self.client.force_login(self.user)
++        url = reverse("calendar:queue_create", kwargs={"workspace_id": self.ws_a.id})
++        response = self.client.post(
++            url,
++            data={
++                "name": "Test Queue",
++                "social_account_id": str(self.account.id),
++                "category_id": str(self.foreign_category.id),
++            },
++        )
++        self.assertEqual(response.status_code, 404)
++        self.assertFalse(Queue.objects.filter(workspace=self.ws_a).exists())
++
++    def test_no_category_creates_queue(self):
++        self.client.force_login(self.user)
++        url = reverse("calendar:queue_create", kwargs={"workspace_id": self.ws_a.id})
++        response = self.client.post(
++            url,
++            data={
++                "name": "Test Queue",
++                "social_account_id": str(self.account.id),
++            },
++        )
++        self.assertLess(response.status_code, 400)
++        self.assertTrue(Queue.objects.filter(workspace=self.ws_a, name="Test Queue").exists())
+diff --git a/apps/calendar/views.py b/apps/calendar/views.py
+index 8d7bbe9b..e9440888 100644
+--- a/apps/calendar/views.py
++++ b/apps/calendar/views.py
+@@ -12,7 +12,9 @@
+ from django.shortcuts import get_object_or_404, redirect, render
+ from django.views.decorators.http import require_POST
+ 
++from apps.common.validators import is_valid_hex_color
+ from apps.composer.models import ContentCategory, PlatformPost, Post
++from apps.members.decorators import require_permission
+ from apps.members.models import WorkspaceMembership
+ from apps.social_accounts.models import SocialAccount
+ from apps.workspaces.models import Workspace
+@@ -1024,11 +1026,17 @@ def queue_create(request, workspace_id):
+ 
+     account = get_object_or_404(SocialAccount, id=account_id, workspace=workspace)
+ 
++    # Scope category to the same workspace — without this, the queue could be
++    # bound to a category from another workspace via a forged POST.
++    category = None
++    if category_id:
++        category = get_object_or_404(ContentCategory, id=category_id, workspace=workspace)
++
+     Queue.objects.create(
+         workspace=workspace,
+         name=name,
+         social_account=account,
+-        category_id=category_id,
++        category=category,
+     )
+ 
+     if request.htmx:
+@@ -1096,6 +1104,7 @@ def queue_reorder(request, workspace_id, queue_id):
+ 
+ 
+ @login_required
++@require_permission("create_posts")
+ @require_POST
+ def event_create(request, workspace_id):
+     """Create a custom calendar event via HTMX."""
+@@ -1109,6 +1118,9 @@ def event_create(request, workspace_id):
+     if not title or not start_date_str or not end_date_str:
+         return JsonResponse({"error": "Title, start date, and end date required."}, status=400)
+ 
++    if not is_valid_hex_color(color):
++        return JsonResponse({"error": "Color must be a 6-digit hex value like #3B82F6."}, status=400)
++
+     try:
+         start = date.fromisoformat(start_date_str)
+         end = date.fromisoformat(end_date_str)
+@@ -1134,6 +1146,7 @@ def event_create(request, workspace_id):
+ 
+ 
+ @login_required
++@require_permission("create_posts")
+ @require_POST
+ def event_edit(request, workspace_id, event_id):
+     """Edit a custom calendar event."""
+@@ -1142,7 +1155,10 @@ def event_edit(request, workspace_id, event_id):
+ 
+     event.title = request.POST.get("title", event.title).strip()
+     event.description = request.POST.get("description", event.description).strip()
+-    event.color = request.POST.get("color", event.color)
++    new_color = request.POST.get("color", event.color)
++    if not is_valid_hex_color(new_color):
++        return JsonResponse({"error": "Color must be a 6-digit hex value like #3B82F6."}, status=400)
++    event.color = new_color
+ 
+     import contextlib
+ 
+@@ -1163,6 +1179,7 @@ def event_edit(request, workspace_id, event_id):
+ 
+ 
+ @login_required
++@require_permission("create_posts")
+ @require_POST
+ def event_delete(request, workspace_id, event_id):
+     """Delete a custom calendar event."""
+diff --git a/apps/common/tests/test_validators.py b/apps/common/tests/test_validators.py
+index 39a00c64..03c7638c 100644
+--- a/apps/common/tests/test_validators.py
++++ b/apps/common/tests/test_validators.py
+@@ -177,3 +177,107 @@ def test_accepts_public_https(self, mock_getaddrinfo):
+     def test_accepts_public_http(self, mock_getaddrinfo):
+         mock_getaddrinfo.return_value = _fake_addrinfo("93.184.216.34")
+         self.assertTrue(is_safe_url("http://example.com/"))
++
++
++class ValidateHexColorTest(SimpleTestCase):
++    """Hex-color validator: 6-digit #RRGGBB or empty only."""
++
++    def test_accepts_lowercase_hex(self):
++        from apps.common.validators import validate_hex_color
++
++        validate_hex_color("#3b82f6")
++
++    def test_accepts_uppercase_hex(self):
++        from apps.common.validators import validate_hex_color
++
++        validate_hex_color("#3B82F6")
++
++    def test_accepts_empty_string(self):
++        from apps.common.validators import validate_hex_color
++
++        validate_hex_color("")
++
++    def test_accepts_none(self):
++        from apps.common.validators import validate_hex_color
++
++        validate_hex_color(None)
++
++    def test_rejects_css_injection_attempt(self):
++        from django.core.exceptions import ValidationError
++
++        from apps.common.validators import validate_hex_color
++
++        with self.assertRaises(ValidationError):
++            validate_hex_color("red;background:url(//evil)")
++
++    def test_rejects_three_digit_short_form(self):
++        from django.core.exceptions import ValidationError
++
++        from apps.common.validators import validate_hex_color
++
++        with self.assertRaises(ValidationError):
++            validate_hex_color("#f00")
++
++    def test_rejects_color_name(self):
++        from django.core.exceptions import ValidationError
++
++        from apps.common.validators import validate_hex_color
++
++        with self.assertRaises(ValidationError):
++            validate_hex_color("red")
++
++    def test_rejects_alpha_channel(self):
++        from django.core.exceptions import ValidationError
++
++        from apps.common.validators import validate_hex_color
++
++        with self.assertRaises(ValidationError):
++            validate_hex_color("#3B82F6FF")
++
++
++class SafeXmlFromStringTest(SimpleTestCase):
++    """XML hardening: bound size, reject DTD/entity declarations."""
++
++    def test_parses_normal_rss(self):
++        from apps.common.validators import safe_xml_fromstring
++
++        body = b"<?xml version='1.0'?><rss><channel><title>OK</title></channel></rss>"
++        root = safe_xml_fromstring(body)
++        self.assertIsNotNone(root)
++        self.assertEqual(root.tag, "rss")
++
++    def test_rejects_billion_laughs(self):
++        from apps.common.validators import safe_xml_fromstring
++
++        body = (
++            b"<?xml version='1.0'?>"
++            b"<!DOCTYPE lolz ["
++            b"  <!ENTITY lol 'lol'>"
++            b"  <!ENTITY lol2 '&lol;&lol;&lol;'>"
++            b"]>"
++            b"<lolz>&lol2;</lolz>"
++        )
++        self.assertIsNone(safe_xml_fromstring(body))
++
++    def test_rejects_doctype_alone(self):
++        from apps.common.validators import safe_xml_fromstring
++
++        body = b"<?xml version='1.0'?><!DOCTYPE feed><rss/>"
++        self.assertIsNone(safe_xml_fromstring(body))
++
++    def test_rejects_oversized(self):
++        from apps.common.validators import safe_xml_fromstring
++
++        body = b"<rss>" + b"x" * (6 * 1024 * 1024) + b"</rss>"
++        self.assertIsNone(safe_xml_fromstring(body))
++
++    def test_rejects_str_input(self):
++        # The helper takes bytes only — callers must encode first.
++        from apps.common.validators import safe_xml_fromstring
++
++        self.assertIsNone(safe_xml_fromstring("<rss/>"))
++
++    def test_rejects_malformed_xml(self):
++        from apps.common.validators import safe_xml_fromstring
++
++        self.assertIsNone(safe_xml_fromstring(b"<rss><channel></rss>"))
+diff --git a/apps/composer/migrations/0016_alter_contentcategory_color.py b/apps/composer/migrations/0016_alter_contentcategory_color.py
+new file mode 100644
+index 00000000..1c1ab79c
+--- /dev/null
++++ b/apps/composer/migrations/0016_alter_contentcategory_color.py
+@@ -0,0 +1,24 @@
++# Generated by Django 5.1.15 on 2026-05-12 07:14
++
++from django.db import migrations, models
++
++import apps.common.validators
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("composer", "0015_per_account_status"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="contentcategory",
++            name="color",
++            field=models.CharField(
++                default="#3B82F6",
++                help_text="Hex color for calendar display, e.g. #FF5733",
++                max_length=7,
++                validators=[apps.common.validators.validate_hex_color],
++            ),
++        ),
++    ]
+diff --git a/apps/composer/models.py b/apps/composer/models.py
+index b5e399da..2d41f054 100644
+--- a/apps/composer/models.py
++++ b/apps/composer/models.py
+@@ -19,6 +19,7 @@
+ from django.utils import timezone
+ 
+ from apps.common.managers import WorkspaceScopedManager
++from apps.common.validators import validate_hex_color
+ 
+ 
+ class ContentCategory(models.Model):
+@@ -39,6 +40,7 @@ class ContentCategory(models.Model):
+         max_length=7,
+         default="#3B82F6",
+         help_text="Hex color for calendar display, e.g. #FF5733",
++        validators=[validate_hex_color],
+     )
+     position = models.PositiveIntegerField(default=0)
+ 
+diff --git a/apps/composer/views.py b/apps/composer/views.py
+index 75d01731..f104007b 100644
+--- a/apps/composer/views.py
++++ b/apps/composer/views.py
+@@ -4,7 +4,6 @@
+ import json
+ import re
+ import uuid
+-import xml.etree.ElementTree as ET
+ from datetime import UTC, datetime
+ from urllib.parse import urljoin
+ 
+@@ -2823,8 +2822,45 @@ def _build_event_from_entry(feed, parsed_feed, entry):
+     }
+ 
+ 
++def _safe_fetch_feed(url, headers, *, timeout=8.0, max_redirects=5):
++    """Fetch *url* with manual redirect handling, re-validating each hop with
++    is_safe_url. Returns (response, final_url) on success or (None, None) on
++    any reject path (initial-URL failed SSRF check, intermediate hop failed
++    SSRF check, broken redirect, transport error).
++    """
++    if not is_safe_url(url):
++        return None, None
++    current_url = url
++    try:
++        response = httpx.get(current_url, headers=headers, timeout=timeout, follow_redirects=False)
++    except httpx.RequestError:
++        return None, None
++    for _ in range(max_redirects):
++        if response.status_code not in (301, 302, 303, 307, 308):
++            return response, current_url
++        location = response.headers.get("Location")
++        if not location:
++            return None, None
++        next_url = urljoin(current_url, location)
++        if not is_safe_url(next_url):
++            return None, None
++        try:
++            response = httpx.get(next_url, headers=headers, timeout=timeout, follow_redirects=False)
++        except httpx.RequestError:
++            return None, None
++        current_url = next_url
++    # Too many redirects.
++    return None, None
++
++
+ def _fetch_feed_events_for_workspace(feeds):
+-    """Fetch and aggregate recent events across all workspace feeds."""
++    """Fetch and aggregate recent events across all workspace feeds.
++
++    Each feed is re-validated against is_safe_url at fetch time (not just at
++    add time), and redirects are followed manually with per-hop SSRF checks.
++    This closes the DNS-rebind / redirect-bait window that would otherwise
++    let a previously-valid feed URL reach internal hosts on subsequent polls.
++    """
+     if not feeds:
+         return []
+ 
+@@ -2833,17 +2869,15 @@ def _fetch_feed_events_for_workspace(feeds):
+         "User-Agent": "Brightbean RSS Reader/1.0",
+     }
+     all_events = []
+-    with httpx.Client(headers=headers, timeout=8.0, follow_redirects=True) as client:
+-        for feed in feeds:
+-            with contextlib.suppress(httpx.RequestError):
+-                response = client.get(feed.url)
+-                if response.status_code >= 400:
+-                    continue
+-                parsed_feed = _parse_feed_document(response.content)
+-                if not parsed_feed:
+-                    continue
+-                for entry in parsed_feed["entries"][:50]:
+-                    all_events.append(_build_event_from_entry(feed, parsed_feed, entry))
++    for feed in feeds:
++        response, _final_url = _safe_fetch_feed(feed.url, headers)
++        if response is None or response.status_code >= 400:
++            continue
++        parsed_feed = _parse_feed_document(response.content)
++        if not parsed_feed:
++            continue
++        for entry in parsed_feed["entries"][:50]:
++            all_events.append(_build_event_from_entry(feed, parsed_feed, entry))
+ 
+     deduped_events = []
+     seen = set()
+@@ -2934,37 +2968,14 @@ def _render_feeds_tab(
+ 
+ def _validate_rss_url(rss_url):
+     """Validate that a URL points to a reachable RSS/Atom XML feed."""
+-    if not is_safe_url(rss_url):
+-        return False, "Could not reach this URL. Please check the link and try again.", {}
+-
+     headers = {
+         "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.1",
+         "User-Agent": "Brightbean RSS Validator/1.0",
+     }
+-    try:
+-        response = httpx.get(rss_url, headers=headers, timeout=8.0, follow_redirects=False)
+-    except httpx.RequestError:
++    response, _final_url = _safe_fetch_feed(rss_url, headers)
++    if response is None:
+         return False, "Could not reach this URL. Please check the link and try again.", {}
+ 
+-    # Follow up to 5 redirects, resolving relative Locations against the current
+-    # request URL and re-validating each absolute hop against is_safe_url to
+-    # defend against redirect-based SSRF (e.g. 302 → http://127.0.0.1).
+-    current_url = rss_url
+-    for _ in range(5):
+-        if response.status_code not in (301, 302, 303, 307, 308):
+-            break
+-        location = response.headers.get("Location")
+-        if not location:
+-            return False, "Could not reach this URL. Please check the link and try again.", {}
+-        next_url = urljoin(current_url, location)
+-        if not is_safe_url(next_url):
+-            return False, "Could not reach this URL. Please check the link and try again.", {}
+-        try:
+-            response = httpx.get(next_url, headers=headers, timeout=8.0, follow_redirects=False)
+-        except httpx.RequestError:
+-            return False, "Could not reach this URL. Please check the link and try again.", {}
+-        current_url = next_url
+-
+     if response.status_code >= 400:
+         return False, "This URL could not be loaded as a feed.", {}
+ 
+diff --git a/apps/inbox/webhooks.py b/apps/inbox/webhooks.py
+index 9a061eca..0a9317fd 100644
+--- a/apps/inbox/webhooks.py
++++ b/apps/inbox/webhooks.py
+@@ -4,7 +4,6 @@
+ import hmac
+ import json
+ import logging
+-import xml.etree.ElementTree as ET
+ 
+ from django.conf import settings
+ from django.http import HttpResponse, HttpResponseForbidden
+@@ -12,6 +11,7 @@
+ from django.views.decorators.http import require_http_methods
+ from django_ratelimit.decorators import ratelimit
+ 
++from apps.common.validators import safe_xml_fromstring
+ from apps.social_accounts.models import SocialAccount
+ 
+ from .models import InboxMessage
+@@ -287,10 +287,9 @@ def youtube_webhook(request):
+ 
+ def _process_youtube_notification(body: bytes):
+     """Parse Atom XML notification from YouTube and upsert messages."""
+-    try:
+-        root = ET.fromstring(body)
+-    except ET.ParseError:
+-        logger.warning("Invalid XML in YouTube webhook payload.")
++    root = safe_xml_fromstring(body)
++    if root is None:
++        logger.warning("Invalid or unsafe XML in YouTube webhook payload.")
+         return
+ 
+     ns = {
+diff --git a/apps/media_library/services.py b/apps/media_library/services.py
+index ee0513a2..92538c7c 100644
+--- a/apps/media_library/services.py
++++ b/apps/media_library/services.py
+@@ -54,11 +54,22 @@ def create_folder(organization, workspace, name, parent_folder=None):
+ 
+ 
+ def create_asset(organization, workspace, uploaded_file, uploaded_by, folder=None):
+-    """Create a new media asset from an uploaded file."""
++    """Create a new media asset from an uploaded file.
++
++    The stored mime_type is taken from a magic-byte sniff, NOT from the
++    client-supplied Content-Type header — defends against attackers uploading
++    e.g. an SVG/HTML payload labelled as image/jpeg, which on local-storage
++    deployments would be served back with the spoofed type and execute script
++    in the viewer's browser.
++    """
++    from .validators import sniff_mime  # local import to avoid validator import cycle on the test path
++
+     file_type, errors = validate_file(uploaded_file)
+     if errors:
+         raise ValidationError(errors)
+ 
++    sniffed_mime = sniff_mime(uploaded_file) or ""
++
+     asset = MediaAsset(
+         organization=organization,
+         workspace=workspace,
+@@ -66,7 +77,7 @@ def create_asset(organization, workspace, uploaded_file, uploaded_by, folder=Non
+         filename=uploaded_file.name,
+         file=uploaded_file,
+         media_type=file_type,
+-        mime_type=uploaded_file.content_type or "",
++        mime_type=sniffed_mime,
+         file_size=uploaded_file.size,
+         uploaded_by=uploaded_by,
+         processing_status=MediaAsset.ProcessingStatus.PENDING,
+diff --git a/apps/media_library/tests/test_security.py b/apps/media_library/tests/test_security.py
+new file mode 100644
+index 00000000..62532bf4
+--- /dev/null
++++ b/apps/media_library/tests/test_security.py
+@@ -0,0 +1,92 @@
++"""Security regression tests for media_library uploads (V3 + V8)."""
++
++from django.core.exceptions import ValidationError
++from django.core.files.uploadedfile import SimpleUploadedFile
++from django.test import SimpleTestCase, TestCase
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.media_library.services import create_asset
++from apps.media_library.validators import (
++    ALLOWED_EXTENSIONS,
++    ALLOWED_MIME_TYPES,
++    sniff_mime,
++    validate_file,
++)
++from apps.organizations.models import Organization
++from apps.workspaces.models import Workspace
++
++PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 14
++JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 28
++
++
++class SvgDisallowedTest(SimpleTestCase):
++    """V3: SVG must be stripped from the upload allow-list entirely."""
++
++    def test_svg_not_in_allowed_mimes(self):
++        self.assertNotIn("image/svg+xml", ALLOWED_MIME_TYPES["image"])
++
++    def test_svg_not_in_allowed_extensions(self):
++        self.assertNotIn("svg", ALLOWED_EXTENSIONS["image"])
++
++
++class SniffMimeTest(SimpleTestCase):
++    """V8: magic-byte sniffer must catch spoofed content-types."""
++
++    def test_recognises_jpeg(self):
++        f = SimpleUploadedFile("a.jpg", JPEG, content_type="application/octet-stream")
++        self.assertEqual(sniff_mime(f), "image/jpeg")
++
++    def test_recognises_png(self):
++        f = SimpleUploadedFile("a.png", PNG, content_type="text/html")
++        self.assertEqual(sniff_mime(f), "image/png")
++
++    def test_rejects_unknown_signature(self):
++        f = SimpleUploadedFile("evil.jpg", b"<svg><script>alert(1)</script></svg>", content_type="image/jpeg")
++        self.assertIsNone(sniff_mime(f))
++
++    def test_validate_file_rejects_html_labelled_as_jpeg(self):
++        f = SimpleUploadedFile(
++            "fake.jpg",
++            b"<html><body>not a jpeg</body></html>",
++            content_type="image/jpeg",
++        )
++        file_type, errors = validate_file(f)
++        self.assertIsNone(file_type)
++        self.assertTrue(errors)
++
++    def test_validate_file_accepts_real_jpeg(self):
++        f = SimpleUploadedFile("real.jpg", JPEG, content_type="image/jpeg")
++        f.size = len(JPEG)
++        file_type, errors = validate_file(f)
++        self.assertEqual(file_type, "image")
++        self.assertEqual(errors, [])
++
++
++class CreateAssetMimeSourceTest(TestCase):
++    """V8: stored mime_type comes from the sniffer, NOT the client header."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="WS")
++        self.user = User.objects.create_user(
++            email="up@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++
++    def test_uploaded_content_type_is_overridden_by_sniff(self):
++        # Client lies about content_type, sending JPEG bytes labelled as PNG.
++        uploaded = SimpleUploadedFile("a.jpg", JPEG, content_type="image/png")
++        asset = create_asset(self.org, self.workspace, uploaded, self.user)
++        self.assertEqual(asset.mime_type, "image/jpeg")
++        self.assertEqual(asset.media_type, "image")
++
++    def test_rejects_html_payload_labelled_as_image(self):
++        uploaded = SimpleUploadedFile(
++            "fake.jpg",
++            b"<html><body>hi</body></html>",
++            content_type="image/jpeg",
++        )
++        with self.assertRaises(ValidationError):
++            create_asset(self.org, self.workspace, uploaded, self.user)
+diff --git a/apps/media_library/validators.py b/apps/media_library/validators.py
+index e8e48575..84c015c8 100644
+--- a/apps/media_library/validators.py
++++ b/apps/media_library/validators.py
+@@ -8,7 +8,6 @@
+         "image/png",
+         "image/webp",
+         "image/gif",
+-        "image/svg+xml",
+     ],
+     "video": [
+         "video/mp4",
+@@ -31,7 +30,7 @@
+     ALL_ALLOWED_MIMES.update(mimes)
+ 
+ ALLOWED_EXTENSIONS = {
+-    "image": ["jpg", "jpeg", "png", "webp", "gif", "svg"],
++    "image": ["jpg", "jpeg", "png", "webp", "gif"],
+     "video": ["mp4", "mov", "avi", "webm"],
+     "document": ["pdf"],
+ }
+@@ -53,14 +52,77 @@ def determine_file_type(mime_type):
+     return MIME_TO_FILE_TYPE.get(mime_type)
+ 
+ 
++# Magic-byte signatures for sniffing the *real* MIME of an uploaded file.
++# Trusting `uploaded_file.content_type` is unsafe because that value is set by
++# the client. Sniffing the first bytes prevents masquerade attacks (e.g. an
++# HTML payload labelled as image/jpeg that, when served from same-origin
++# storage, executes script in the user's browser).
++def sniff_mime(file_obj):
++    """Return the sniffed MIME type for an uploaded-file-like object, or None.
++
++    Reads the first 32 bytes and matches them against a small allowlist of
++    well-known signatures. Always restores the read position. Returns None for
++    any unknown / mismatched signature — callers should treat that as a hard
++    reject rather than a soft "unknown".
++    """
++    if not hasattr(file_obj, "read") or not hasattr(file_obj, "seek"):
++        return None
++    import contextlib
++
++    try:
++        file_obj.seek(0)
++        head = file_obj.read(32)
++    except (OSError, ValueError):
++        return None
++    finally:
++        with contextlib.suppress(OSError, ValueError):
++            file_obj.seek(0)
++
++    if not isinstance(head, (bytes, bytearray)):
++        return None
++    if head.startswith(b"\xff\xd8\xff"):
++        return "image/jpeg"
++    if head.startswith(b"\x89PNG\r\n\x1a\n"):
++        return "image/png"
++    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
++        return "image/gif"
++    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
++        return "image/webp"
++    if head[4:8] == b"ftyp":
++        # ISO Base Media: covers MP4, MOV/QuickTime, M4V. Brand-sniffing would
++        # let us split mov from mp4, but our allow-list treats both as video.
++        brand = head[8:12]
++        if brand in (b"qt  ",):
++            return "video/quicktime"
++        return "video/mp4"
++    if head.startswith(b"\x1aE\xdf\xa3"):
++        return "video/webm"
++    if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
++        return "video/x-msvideo"
++    if head.startswith(b"%PDF-"):
++        return "application/pdf"
++    return None
++
++
+ def validate_file(uploaded_file):
+-    """Validate an uploaded file. Returns (file_type, errors)."""
++    """Validate an uploaded file. Returns (file_type, errors).
++
++    Trusts the sniffed magic bytes, not the client-supplied Content-Type. The
++    client header is only used to size-check before we read the body; the
++    file's declared media_type is set from the sniffed value by the caller.
++    """
+     errors = []
+-    content_type = uploaded_file.content_type or ""
+-    file_type = determine_file_type(content_type)
+ 
++    sniffed = sniff_mime(uploaded_file)
++    if not sniffed or sniffed not in ALL_ALLOWED_MIMES:
++        # Reject. We do not echo back the client-supplied content_type because
++        # that's misleading when the magic doesn't match.
++        errors.append("Unsupported or unrecognised file type.")
++        return None, errors
++
++    file_type = determine_file_type(sniffed)
+     if not file_type:
+-        errors.append(f"Unsupported file type: {content_type}")
++        errors.append("Unsupported file type.")
+         return None, errors
+ 
+     max_size = MAX_FILE_SIZES.get(file_type, 20 * 1024 * 1024)
+diff --git a/apps/members/services.py b/apps/members/services.py
+index ece14043..35789185 100644
+--- a/apps/members/services.py
++++ b/apps/members/services.py
+@@ -16,8 +16,46 @@
+ 
+ INVITE_EXPIRY_DAYS = 7
+ 
++# Role hierarchies (must match decorators.py).
++ORG_ROLE_LEVEL = {
++    OrgMembership.OrgRole.OWNER: 3,
++    OrgMembership.OrgRole.ADMIN: 2,
++    OrgMembership.OrgRole.MEMBER: 1,
++}
++WS_ROLE_LEVEL = {
++    WorkspaceMembership.WorkspaceRole.OWNER: 6,
++    WorkspaceMembership.WorkspaceRole.MANAGER: 5,
++    WorkspaceMembership.WorkspaceRole.EDITOR: 4,
++    WorkspaceMembership.WorkspaceRole.CONTRIBUTOR: 3,
++    WorkspaceMembership.WorkspaceRole.CLIENT: 2,
++    WorkspaceMembership.WorkspaceRole.VIEWER: 1,
++}
++
++
++def _inviter_org_level(inviter, org):
++    membership = OrgMembership.objects.filter(user=inviter, organization=org).first()
++    if not membership:
++        return 0
++    return ORG_ROLE_LEVEL.get(membership.org_role, 0)
++
++
++def _inviter_workspace_level(inviter, org, workspace_id):
++    """Return inviter's effective workspace role level in *workspace_id*.
++
++    Org owners are treated as workspace owners across every workspace in their
++    org (matches the spirit of `@require_org_role("owner")` gating org-wide
++    actions). Org admins are bounded by their actual workspace membership; if
++    they aren't a member, they have zero authority on that workspace.
++    """
++    if _inviter_org_level(inviter, org) >= ORG_ROLE_LEVEL[OrgMembership.OrgRole.OWNER]:
++        return WS_ROLE_LEVEL[WorkspaceMembership.WorkspaceRole.OWNER]
++    ws_membership = WorkspaceMembership.objects.filter(user=inviter, workspace_id=workspace_id).first()
++    if not ws_membership:
++        return 0
++    return WS_ROLE_LEVEL.get(ws_membership.workspace_role, 0)
++
+ 
+-def create_invitation(org, email, org_role, workspace_assignments, invited_by):
++def create_invitation(org, email, org_role, workspace_assignments, invited_by, *, inviter=None):
+     """Create an invitation and send the invite email.
+ 
+     Args:
+@@ -49,7 +87,26 @@ def create_invitation(org, email, org_role, workspace_assignments, invited_by):
+     if pending:
+         raise ValueError("An invitation is already pending for this email. You can resend it instead.")
+ 
+-    # Validate workspace assignments belong to org
++    # Don't allow inviting as owner (use ownership transfer instead).
++    if org_role == OrgMembership.OrgRole.OWNER:
++        raise ValueError("Cannot invite someone as an organization owner.")
++
++    # Enforce org-role hierarchy: inviter cannot grant a role above their own.
++    # Default `inviter` to `invited_by` so legacy callers without the kwarg
++    # still get an enforced check (no silent bypass).
++    effective_inviter = inviter or invited_by
++    inviter_org_level = _inviter_org_level(effective_inviter, org)
++    requested_org_level = ORG_ROLE_LEVEL.get(org_role, 0)
++    if requested_org_level == 0:
++        raise ValueError(f"Unknown org role: {org_role!r}.")
++    # Strict inequality on org-role: only owners can grant admin, only admins
++    # can grant member. Blocks lateral admin grants that would let a
++    # compromised admin (eg. via XSS) clone their privileges to an attacker.
++    if requested_org_level >= inviter_org_level:
++        raise ValueError("You cannot invite someone to an organization role at or above your own.")
++
++    # Validate workspace assignments belong to org AND don't exceed inviter's
++    # workspace role in that specific workspace.
+     org_workspace_ids = set(Workspace.objects.filter(organization=org, is_archived=False).values_list("id", flat=True))
+     for assignment in workspace_assignments:
+         import uuid as uuid_mod
+@@ -58,9 +115,13 @@ def create_invitation(org, email, org_role, workspace_assignments, invited_by):
+         if ws_id not in org_workspace_ids:
+             raise ValueError(f"Workspace {ws_id} does not belong to this organization.")
+ 
+-    # Don't allow inviting as owner
+-    if org_role == OrgMembership.OrgRole.OWNER:
+-        raise ValueError("Cannot invite someone as an organization owner.")
++        requested_ws_role = assignment.get("role", WorkspaceMembership.WorkspaceRole.VIEWER)
++        requested_ws_level = WS_ROLE_LEVEL.get(requested_ws_role, 0)
++        if requested_ws_level == 0:
++            raise ValueError(f"Unknown workspace role: {requested_ws_role!r}.")
++        inviter_ws_level = _inviter_workspace_level(effective_inviter, org, ws_id)
++        if requested_ws_level > inviter_ws_level:
++            raise ValueError("You cannot grant a workspace role higher than your own in that workspace.")
+ 
+     invitation = Invitation.objects.create(
+         organization=org,
+@@ -188,15 +249,31 @@ def remove_member(org, membership, removed_by):
+     membership.delete()
+ 
+ 
+-def update_member_org_role(org, membership, new_role):
++def update_member_org_role(org, membership, new_role, *, caller=None):
+     """Update a member's organization role.
+ 
+     Raises:
+-        ValueError: If demoting the last owner.
++        ValueError: If demoting the last owner, or if `caller` lacks authority
++            to either remove the existing role or set the requested one.
+     """
+     if new_role == OrgMembership.OrgRole.OWNER:
+         raise ValueError("Cannot promote to owner. Transfer ownership instead.")
+ 
++    new_level = ORG_ROLE_LEVEL.get(new_role, 0)
++    if new_level == 0:
++        raise ValueError(f"Unknown org role: {new_role!r}.")
++
++    # Caller hierarchy: must be at least as senior as both the existing role
++    # and the requested role. Blocks an admin demoting an owner (existing
++    # role outranks them) or escalating someone above their own tier.
++    if caller is not None:
++        caller_level = _inviter_org_level(caller, org)
++        existing_level = ORG_ROLE_LEVEL.get(membership.org_role, 0)
++        if caller_level < existing_level:
++            raise ValueError("You cannot change a member whose role is higher than your own.")
++        if caller_level <= new_level:
++            raise ValueError("You cannot assign a role at or above your own.")
++
+     if membership.org_role == OrgMembership.OrgRole.OWNER:
+         owner_count = OrgMembership.objects.filter(organization=org, org_role=OrgMembership.OrgRole.OWNER).count()
+         if owner_count <= 1:
+@@ -207,13 +284,16 @@ def update_member_org_role(org, membership, new_role):
+     return membership
+ 
+ 
+-def update_workspace_assignments(org, user, assignments):
++def update_workspace_assignments(org, user, assignments, *, inviter=None):
+     """Update workspace assignments for a member.
+ 
+     Args:
+         org: Organization.
+         user: The user whose assignments to update.
+         assignments: list of {"workspace_id": "...", "role": "..."}.
++        inviter: The user performing the change (for role-hierarchy enforcement).
++            When None, no caller-level check is applied (used only by tests or
++            internal admin scripts).
+     """
+     import uuid as uuid_mod
+ 
+@@ -224,7 +304,15 @@ def update_workspace_assignments(org, user, assignments):
+         ws_id = uuid_mod.UUID(str(a["workspace_id"]))
+         if ws_id not in org_workspace_ids:
+             raise ValueError(f"Workspace {ws_id} does not belong to this organization.")
+-        desired[ws_id] = a.get("role", WorkspaceMembership.WorkspaceRole.VIEWER)
++        requested_role = a.get("role", WorkspaceMembership.WorkspaceRole.VIEWER)
++        requested_level = WS_ROLE_LEVEL.get(requested_role, 0)
++        if requested_level == 0:
++            raise ValueError(f"Unknown workspace role: {requested_role!r}.")
++        if inviter is not None:
++            inviter_level = _inviter_workspace_level(inviter, org, ws_id)
++            if requested_level > inviter_level:
++                raise ValueError("You cannot grant a workspace role higher than your own in that workspace.")
++        desired[ws_id] = requested_role
+ 
+     # Current assignments in this org
+     current = WorkspaceMembership.objects.filter(
+diff --git a/apps/members/tests/__init__.py b/apps/members/tests/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apps/members/tests/test_role_hierarchy.py b/apps/members/tests/test_role_hierarchy.py
+new file mode 100644
+index 00000000..ee416bfc
+--- /dev/null
++++ b/apps/members/tests/test_role_hierarchy.py
+@@ -0,0 +1,163 @@
++"""HTTP-level tests for invite / role-management hierarchy enforcement.
++
++Covers V1 from the May-2026 security audit: an org admin must not be able to
++invite users with org/workspace roles above their own, nor demote an org owner.
++"""
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.members.models import Invitation, OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.workspaces.models import Workspace
++
++
++def _login(client, user):
++    client.force_login(user)
++
++
++def _make_user(email):
++    user = User.objects.create_user(
++        email=email,
++        password="testpass123",
++        tos_accepted_at=timezone.now(),
++    )
++    # The accounts post_save signal auto-provisions a default Organization +
++    # Workspace + OrgMembership for every new User. Tests that want to attach
++    # the user to a specific org must start from a clean slate, otherwise the
++    # RBAC middleware (which does OrgMembership.objects.filter(...).first())
++    # may pick the auto-org instead of the test org.
++    from apps.members.models import OrgMembership, WorkspaceMembership
++    from apps.organizations.models import Organization
++
++    auto_org_ids = list(OrgMembership.objects.filter(user=user).values_list("organization_id", flat=True))
++    WorkspaceMembership.objects.filter(user=user).delete()
++    OrgMembership.objects.filter(user=user).delete()
++    Organization.objects.filter(id__in=auto_org_ids).delete()
++    return user
++
++
++class InviteRoleHierarchyTests(TestCase):
++    """POST /members/invite/ must enforce role-hierarchy."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace_a = Workspace.objects.create(organization=self.org, name="WS-A")
++        self.workspace_b = Workspace.objects.create(organization=self.org, name="WS-B")
++
++        self.owner = _make_user("owner@example.com")
++        self.admin = _make_user("admin@example.com")
++        OrgMembership.objects.create(user=self.owner, organization=self.org, org_role="owner")
++        OrgMembership.objects.create(user=self.admin, organization=self.org, org_role="admin")
++        # Admin is a viewer in WS-A (cannot grant owner there) and not a member of WS-B.
++        WorkspaceMembership.objects.create(user=self.admin, workspace=self.workspace_a, workspace_role="viewer")
++
++        self.url = reverse("members:invite")
++
++    def test_admin_cannot_invite_as_owner_of_workspace_they_only_view(self):
++        _login(self.client, self.admin)
++        response = self.client.post(
++            self.url,
++            data={
++                "email": "victim@example.com",
++                "org_role": "member",
++                f"ws_{self.workspace_a.id}": "1",
++                f"ws_role_{self.workspace_a.id}": "owner",
++            },
++        )
++        self.assertEqual(response.status_code, 422)
++        self.assertFalse(Invitation.objects.filter(email="victim@example.com").exists())
++
++    def test_admin_cannot_invite_into_workspace_they_dont_belong_to(self):
++        _login(self.client, self.admin)
++        response = self.client.post(
++            self.url,
++            data={
++                "email": "victim@example.com",
++                "org_role": "member",
++                f"ws_{self.workspace_b.id}": "1",
++                f"ws_role_{self.workspace_b.id}": "viewer",
++            },
++        )
++        self.assertEqual(response.status_code, 422)
++        self.assertFalse(Invitation.objects.filter(email="victim@example.com").exists())
++
++    def test_admin_cannot_invite_as_admin(self):
++        # Only owners can grant admin (lateral grants from admin → admin forbidden).
++        _login(self.client, self.admin)
++        response = self.client.post(
++            self.url,
++            data={
++                "email": "lateral@example.com",
++                "org_role": "admin",
++            },
++        )
++        self.assertEqual(response.status_code, 422)
++        self.assertFalse(Invitation.objects.filter(email="lateral@example.com").exists())
++
++    def test_owner_can_invite_admin_with_any_workspace_role(self):
++        _login(self.client, self.owner)
++        response = self.client.post(
++            self.url,
++            data={
++                "email": "legit@example.com",
++                "org_role": "admin",
++                f"ws_{self.workspace_a.id}": "1",
++                f"ws_role_{self.workspace_a.id}": "owner",
++            },
++        )
++        # 200 (HTML redirect) or 302 — anything < 400 means accepted. The view
++        # returns redirect to members:list for non-HTMX flows.
++        self.assertLess(response.status_code, 400)
++        self.assertTrue(Invitation.objects.filter(email="legit@example.com").exists())
++
++    def test_admin_with_manager_role_can_invite_editor(self):
++        WorkspaceMembership.objects.create(user=self.admin, workspace=self.workspace_b, workspace_role="manager")
++        _login(self.client, self.admin)
++        response = self.client.post(
++            self.url,
++            data={
++                "email": "editor@example.com",
++                "org_role": "member",
++                f"ws_{self.workspace_b.id}": "1",
++                f"ws_role_{self.workspace_b.id}": "editor",
++            },
++        )
++        self.assertLess(response.status_code, 400)
++        self.assertTrue(Invitation.objects.filter(email="editor@example.com").exists())
++
++
++class UpdateMemberRoleHierarchyTests(TestCase):
++    """POST /members/<id>/role/ — admin cannot demote owner."""
++
++    def setUp(self):
++        self.org = Organization.objects.create(name="Test Org")
++        self.owner = _make_user("owner@example.com")
++        self.other_owner = _make_user("owner2@example.com")
++        self.admin = _make_user("admin@example.com")
++        OrgMembership.objects.create(user=self.owner, organization=self.org, org_role="owner")
++        self.other_owner_membership = OrgMembership.objects.create(
++            user=self.other_owner, organization=self.org, org_role="owner"
++        )
++        OrgMembership.objects.create(user=self.admin, organization=self.org, org_role="admin")
++
++    def test_admin_cannot_demote_owner(self):
++        _login(self.client, self.admin)
++        url = reverse("members:update_role", kwargs={"membership_id": self.other_owner_membership.id})
++        response = self.client.post(url, data={"org_role": "admin"})
++        self.assertEqual(response.status_code, 422)
++        self.other_owner_membership.refresh_from_db()
++        self.assertEqual(self.other_owner_membership.org_role, "owner")
++
++    def test_admin_cannot_promote_member_to_admin(self):
++        # Lateral promotion to admin requires owner privileges.
++        member = _make_user("member@example.com")
++        membership = OrgMembership.objects.create(user=member, organization=self.org, org_role="member")
++        _login(self.client, self.admin)
++        url = reverse("members:update_role", kwargs={"membership_id": membership.id})
++        response = self.client.post(url, data={"org_role": "admin"})
++        self.assertEqual(response.status_code, 422)
++        membership.refresh_from_db()
++        self.assertEqual(membership.org_role, "member")
+diff --git a/apps/members/views.py b/apps/members/views.py
+index 147a1693..220f4cd4 100644
+--- a/apps/members/views.py
++++ b/apps/members/views.py
+@@ -125,6 +125,7 @@ def invite_member(request):
+             org_role=org_role,
+             workspace_assignments=workspace_assignments,
+             invited_by=request.user,
++            inviter=request.user,
+         )
+     except ValueError as e:
+         return HttpResponse(
+@@ -262,7 +263,7 @@ def update_member_role(request, membership_id):
+     new_role = request.POST.get("org_role")
+ 
+     try:
+-        services.update_member_org_role(request.org, membership, new_role)
++        services.update_member_org_role(request.org, membership, new_role, caller=request.user)
+     except ValueError as e:
+         return HttpResponse(
+             f'<div class="text-red-600 text-sm">{e}</div>',
+@@ -351,7 +352,7 @@ def manage_workspaces(request, membership_id):
+                 )
+ 
+         try:
+-            services.update_workspace_assignments(org, membership.user, assignments)
++            services.update_workspace_assignments(org, membership.user, assignments, inviter=request.user)
+         except ValueError as e:
+             return HttpResponse(str(e), status=422)
+ 
+diff --git a/apps/notifications/engine.py b/apps/notifications/engine.py
+index a4e029c3..f30d7d4d 100644
+--- a/apps/notifications/engine.py
++++ b/apps/notifications/engine.py
+@@ -259,7 +259,15 @@ def _dispatch_email(delivery: NotificationDelivery) -> None:
+ 
+ 
+ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+-    """Send notification via webhook (HTTP POST with HMAC-SHA256 signature)."""
++    """Send notification via webhook (HTTP POST with HMAC-SHA256 signature).
++
++    The webhook URL is re-validated with is_safe_url at dispatch time (not just
++    when stored), and redirects are not followed. This narrows the DNS-rebind
++    window between validation and connection. We still rely on the OS-level DNS
++    cache to resolve consistently within a single dispatch; deployments with
++    aggressive DNS-rebind threat models should additionally enforce egress
++    firewall rules.
++    """
+     import httpx
+ 
+     from apps.common.validators import is_safe_url
+@@ -271,6 +279,9 @@ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+         logger.info("No webhook_url in notification data, skipping webhook delivery")
+         return
+ 
++    # Re-validate immediately before the request. The single-pass DNS resolve
++    # used by is_safe_url is reused by httpx via the OS resolver cache; this
++    # is the simplest defence that doesn't add an httpx-transport dependency.
+     if not is_safe_url(webhook_url):
+         raise RuntimeError("Webhook URL rejected: must be a public http(s) endpoint")
+ 
+@@ -299,7 +310,12 @@ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+         "X-Event-Type": notification.event_type,
+     }
+ 
++    # follow_redirects=False prevents a 302→private-IP bait-and-switch from a
++    # legitimate-looking endpoint. Any redirect is surfaced as a delivery
++    # failure, not silently followed.
+     response = httpx.post(webhook_url, content=payload, headers=headers, timeout=10.0, follow_redirects=False)
++    if 300 <= response.status_code < 400:
++        raise RuntimeError(f"Webhook URL replied with redirect {response.status_code} — refusing to follow.")
+     if response.status_code >= 400:
+         raise RuntimeError(f"Webhook returned HTTP {response.status_code}")
+ 
+diff --git a/apps/workspaces/migrations/0003_alter_workspace_primary_color_and_more.py b/apps/workspaces/migrations/0003_alter_workspace_primary_color_and_more.py
+new file mode 100644
+index 00000000..3115548a
+--- /dev/null
++++ b/apps/workspaces/migrations/0003_alter_workspace_primary_color_and_more.py
+@@ -0,0 +1,28 @@
++# Generated by Django 5.1.15 on 2026-05-12 07:14
++
++from django.db import migrations, models
++
++import apps.common.validators
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("workspaces", "0002_replace_icon_url_with_icon"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="workspace",
++            name="primary_color",
++            field=models.CharField(
++                blank=True, default="", max_length=7, validators=[apps.common.validators.validate_hex_color]
++            ),
++        ),
++        migrations.AlterField(
++            model_name="workspace",
++            name="secondary_color",
++            field=models.CharField(
++                blank=True, default="", max_length=7, validators=[apps.common.validators.validate_hex_color]
++            ),
++        ),
++    ]
+diff --git a/apps/workspaces/models.py b/apps/workspaces/models.py
+index fd30e4d4..4acc06fe 100644
+--- a/apps/workspaces/models.py
++++ b/apps/workspaces/models.py
+@@ -3,6 +3,7 @@
+ from django.db import models
+ 
+ from apps.common.managers import OrgScopedManager
++from apps.common.validators import validate_hex_color
+ 
+ 
+ class Workspace(models.Model):
+@@ -22,8 +23,8 @@ class ApprovalWorkflowMode(models.TextChoices):
+     icon = models.ImageField(upload_to="workspaces/icons/%Y/%m/", blank=True)
+     description = models.CharField(max_length=500, blank=True, default="")
+     timezone = models.CharField(max_length=63, blank=True, default="")
+-    primary_color = models.CharField(max_length=7, blank=True, default="")
+-    secondary_color = models.CharField(max_length=7, blank=True, default="")
++    primary_color = models.CharField(max_length=7, blank=True, default="", validators=[validate_hex_color])
++    secondary_color = models.CharField(max_length=7, blank=True, default="", validators=[validate_hex_color])
+     default_hashtags = models.JSONField(default=list, blank=True)
+     default_first_comment = models.TextField(blank=True, default="")
+     approval_workflow_mode = models.CharField(

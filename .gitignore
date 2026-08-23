@@ -226,3 +226,6 @@ theme/static/css/dist/
 # Local seed scripts (not for version control)
 /seed_ad_analytics.py
 /seed_ad_calendar.py
+
+# Local-only security notes — undisclosed findings, never commit (see docs/security/verification.md)
+docs/security/*.local.md

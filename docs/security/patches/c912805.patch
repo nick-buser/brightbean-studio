@@ -1,0 +1,1433 @@
+From c912805f76f018c93416164c52753e5a98ba7d25 Mon Sep 17 00:00:00 2001
+From: Jan Schmitz <jan.schmitz@whu.edu>
+Date: Mon, 11 May 2026 15:17:03 +0200
+Subject: [PATCH] harden XSS script-block, promote tag normalization, fix
+ SSRF/file-size/auth-timing
+
+Follow-ups from the composer/media-library XSS fix plus broader audit findings:
+
+* compose.html script block: replace four |safe JSON interpolations with
+  Django's |json_script + JSON.parse, closing the </script>-breakout vector
+  inside Alpine's composerApp.
+* Promote _normalize_tags + constants to apps/common/validators.py. Add
+  parse_and_truncate_tag_string and parse_and_truncate_youtube_tag_string
+  helpers for lenient (form POST) paths. Apply across composer save_post,
+  autosave, idea_create, idea_update, and YouTube yt_tags.
+* Add HTTP-level integration tests for media-library tag endpoints and
+  composer save_post (including XSS round-trip + json_script container
+  assertions).
+* SSRF: validate RSS feed URLs and notification webhook URLs against
+  private/loopback/link-local IPs via is_safe_url; manual redirect handling
+  with per-hop re-validation on the RSS path.
+* CSV upload: cap at 5 MB before reading into memory.
+* Calendar slot delete/update: scope the get_object_or_404 query to the
+  workspace so cross-workspace slot IDs return 404 from the DB lookup,
+  not from a post-lookup ownership check.
+* Inline comment on apps/onboarding/checklist.py:icon_svg noting that the
+  field must remain a server-side constant (rendered with |safe).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ apps/calendar/tests.py                        | 115 +++++++++++
+ apps/calendar/views.py                        |  17 +-
+ apps/common/tests/__init__.py                 |   0
+ apps/common/tests/test_validators.py          | 179 +++++++++++++++++
+ apps/common/validators.py                     |  93 ++++++++-
+ apps/composer/forms.py                        |  16 +-
+ apps/composer/tests/test_csv_upload_size.py   |  52 +++++
+ apps/composer/tests/test_save_post_tags.py    | 187 ++++++++++++++++++
+ apps/composer/views.py                        |  49 +++--
+ apps/media_library/tests/__init__.py          |   0
+ .../test_models_and_filters.py}               |  22 +--
+ .../media_library/tests/test_tag_endpoints.py | 149 ++++++++++++++
+ apps/media_library/views.py                   |  35 +---
+ apps/notifications/engine.py                  |  38 ++--
+ apps/notifications/tests.py                   |  70 +++++++
+ apps/onboarding/checklist.py                  |   4 +
+ templates/composer/compose.html               |  12 +-
+ 17 files changed, 942 insertions(+), 96 deletions(-)
+ create mode 100644 apps/common/tests/__init__.py
+ create mode 100644 apps/common/tests/test_validators.py
+ create mode 100644 apps/composer/tests/test_csv_upload_size.py
+ create mode 100644 apps/composer/tests/test_save_post_tags.py
+ create mode 100644 apps/media_library/tests/__init__.py
+ rename apps/media_library/{tests.py => tests/test_models_and_filters.py} (88%)
+ create mode 100644 apps/media_library/tests/test_tag_endpoints.py
+
+diff --git a/apps/calendar/tests.py b/apps/calendar/tests.py
+index 852651f6..fd1f7b70 100644
+--- a/apps/calendar/tests.py
++++ b/apps/calendar/tests.py
+@@ -3,8 +3,15 @@
+ from datetime import time
+ 
+ from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
+ 
++from apps.accounts.models import User
+ from apps.calendar.models import PostingSlot
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.social_accounts.models import SocialAccount
++from apps.workspaces.models import Workspace
+ 
+ 
+ class PostingSlotModelTest(TestCase):
+@@ -33,3 +40,111 @@ def test_day_name_property(self):
+         slot = PostingSlot()
+         slot.day_of_week = 4
+         self.assertEqual(slot.day_name, "Friday")
++
++
++class PostingSlotCrossWorkspaceTests(TestCase):
++    """Slot endpoints must scope to the requesting workspace.
++
++    Regression for permission-timing leak: a 404 must come from the workspace-
++    scoped query, not from a post-lookup membership check.
++    """
++
++    def setUp(self):
++        self.user_a = User.objects.create_user(
++            email="a@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org_a = Organization.objects.create(name="Org A")
++        self.workspace_a = Workspace.objects.create(organization=self.org_a, name="Workspace A")
++        OrgMembership.objects.create(
++            user=self.user_a,
++            organization=self.org_a,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user_a,
++            workspace=self.workspace_a,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++        self.account_a = SocialAccount.objects.create(
++            workspace=self.workspace_a,
++            platform="instagram",
++            account_platform_id="ig-a",
++            account_name="A",
++            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
++        )
++        self.slot_a = PostingSlot.objects.create(
++            social_account=self.account_a,
++            day_of_week=0,
++            time=time(9, 0),
++        )
++
++        # A second workspace and user — completely isolated
++        self.user_b = User.objects.create_user(
++            email="b@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org_b = Organization.objects.create(name="Org B")
++        self.workspace_b = Workspace.objects.create(organization=self.org_b, name="Workspace B")
++        OrgMembership.objects.create(
++            user=self.user_b,
++            organization=self.org_b,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user_b,
++            workspace=self.workspace_b,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++
++    def test_delete_slot_from_own_workspace_returns_404_for_slot_in_other_workspace(self):
++        """User A scopes the delete URL to workspace A but passes B's slot id."""
++        self.client.force_login(self.user_a)
++        # workspace A in URL but slot belongs to workspace A — sanity check happy path
++        # (deletes a slot the user is allowed to delete)
++        url = reverse(
++            "calendar:delete_posting_slot",
++            kwargs={"workspace_id": self.workspace_a.id, "slot_id": self.slot_a.id},
++        )
++        response = self.client.post(url)
++        self.assertEqual(response.status_code, 200)
++        self.assertFalse(PostingSlot.objects.filter(id=self.slot_a.id).exists())
++
++    def test_delete_slot_belonging_to_different_workspace_returns_404(self):
++        """A new slot in workspace A; user B (different workspace) tries to delete via /workspace/<B>/."""
++        slot_a2 = PostingSlot.objects.create(
++            social_account=self.account_a,
++            day_of_week=1,
++            time=time(10, 0),
++        )
++        self.client.force_login(self.user_b)
++        # User B uses their OWN workspace_id in the URL (auth passes), but the
++        # slot_id is from workspace A. Pre-fix this leaked existence via 404
++        # only AFTER the lookup; post-fix the workspace-scoped query never
++        # finds it.
++        url = reverse(
++            "calendar:delete_posting_slot",
++            kwargs={"workspace_id": self.workspace_b.id, "slot_id": slot_a2.id},
++        )
++        response = self.client.post(url)
++        self.assertEqual(response.status_code, 404)
++        # Slot must still exist
++        self.assertTrue(PostingSlot.objects.filter(id=slot_a2.id).exists())
++
++    def test_update_slot_belonging_to_different_workspace_returns_404(self):
++        slot_a2 = PostingSlot.objects.create(
++            social_account=self.account_a,
++            day_of_week=2,
++            time=time(11, 0),
++        )
++        self.client.force_login(self.user_b)
++        url = reverse(
++            "calendar:update_posting_slot",
++            kwargs={"workspace_id": self.workspace_b.id, "slot_id": slot_a2.id},
++        )
++        response = self.client.post(url, data={"time": "13:30"})
++        self.assertEqual(response.status_code, 404)
++        slot_a2.refresh_from_db()
++        self.assertEqual(slot_a2.time, time(11, 0))
+diff --git a/apps/calendar/views.py b/apps/calendar/views.py
+index a92fa037..8d7bbe9b 100644
+--- a/apps/calendar/views.py
++++ b/apps/calendar/views.py
+@@ -882,10 +882,11 @@ def save_posting_slot(request, workspace_id):
+ def delete_posting_slot(request, workspace_id, slot_id):
+     """Delete a posting slot."""
+     workspace = _get_workspace(request, workspace_id)
+-    slot = get_object_or_404(PostingSlot, id=slot_id)
+-    # Verify the slot belongs to this workspace
+-    if slot.social_account.workspace_id != workspace.id:
+-        return JsonResponse({"error": "Not found."}, status=404)
++    slot = get_object_or_404(
++        PostingSlot,
++        id=slot_id,
++        social_account__workspace=workspace,
++    )
+ 
+     account_id = str(slot.social_account_id)
+     slot.delete()
+@@ -946,9 +947,11 @@ def toggle_posting_slot_day(request, workspace_id):
+ def update_posting_slot(request, workspace_id, slot_id):
+     """Update a posting slot's time."""
+     workspace = _get_workspace(request, workspace_id)
+-    slot = get_object_or_404(PostingSlot, id=slot_id)
+-    if slot.social_account.workspace_id != workspace.id:
+-        return JsonResponse({"error": "Not found."}, status=404)
++    slot = get_object_or_404(
++        PostingSlot,
++        id=slot_id,
++        social_account__workspace=workspace,
++    )
+ 
+     time_str = request.POST.get("time")
+     if not time_str:
+diff --git a/apps/common/tests/__init__.py b/apps/common/tests/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apps/common/tests/test_validators.py b/apps/common/tests/test_validators.py
+new file mode 100644
+index 00000000..39a00c64
+--- /dev/null
++++ b/apps/common/tests/test_validators.py
+@@ -0,0 +1,179 @@
++"""Tests for apps.common.validators."""
++
++from unittest.mock import patch
++
++from django.test import SimpleTestCase
++
++from apps.common.validators import (
++    MAX_TAG_LENGTH,
++    MAX_TAGS,
++    MAX_YT_TAG_LENGTH,
++    MAX_YT_TAGS_TOTAL_CHARS,
++    is_safe_url,
++    normalize_tags,
++    parse_and_truncate_tag_string,
++    parse_and_truncate_youtube_tag_string,
++)
++
++
++def _fake_addrinfo(ip):
++    return [(0, 0, 0, "", (ip, 0))]
++
++
++class NormalizeTagsTest(SimpleTestCase):
++    """Strict normalization for JSON API endpoints."""
++
++    def test_rejects_non_list(self):
++        with self.assertRaises(ValueError):
++            normalize_tags({"foo": "bar"})
++
++    def test_rejects_too_many(self):
++        with self.assertRaises(ValueError):
++            normalize_tags(["x"] * (MAX_TAGS + 1))
++
++    def test_accepts_at_limit(self):
++        result = normalize_tags([f"tag{i}" for i in range(MAX_TAGS)])
++        self.assertEqual(len(result), MAX_TAGS)
++
++    def test_rejects_oversized(self):
++        with self.assertRaises(ValueError):
++            normalize_tags(["x" * (MAX_TAG_LENGTH + 1)])
++
++    def test_rejects_non_string_element(self):
++        with self.assertRaises(ValueError):
++            normalize_tags([123])
++
++    def test_strips_whitespace_and_dedupes(self):
++        self.assertEqual(normalize_tags(["  a  ", "a", "b", "", "   "]), ["a", "b"])
++
++    def test_preserves_malicious_payload_verbatim(self):
++        payload = "<script>alert(1)</script>"
++        self.assertEqual(normalize_tags([payload]), [payload])
++
++
++class ParseAndTruncateTagStringTest(SimpleTestCase):
++    """Lenient normalization for HTML form POSTs — silently truncates."""
++
++    def test_empty_string_returns_empty_list(self):
++        self.assertEqual(parse_and_truncate_tag_string(""), [])
++
++    def test_whitespace_only_returns_empty_list(self):
++        self.assertEqual(parse_and_truncate_tag_string("   ,  ,  "), [])
++
++    def test_strips_and_dedupes(self):
++        self.assertEqual(parse_and_truncate_tag_string("  a, a, b, ,c"), ["a", "b", "c"])
++
++    def test_truncates_count_to_max_tags(self):
++        raw = ",".join(f"tag{i}" for i in range(MAX_TAGS + 5))
++        out = parse_and_truncate_tag_string(raw)
++        self.assertEqual(len(out), MAX_TAGS)
++        self.assertEqual(out[0], "tag0")
++        self.assertEqual(out[-1], f"tag{MAX_TAGS - 1}")
++
++    def test_truncates_overlong_tag(self):
++        long_tag = "x" * (MAX_TAG_LENGTH + 50)
++        out = parse_and_truncate_tag_string(long_tag)
++        self.assertEqual(out, ["x" * MAX_TAG_LENGTH])
++
++    def test_preserves_malicious_payload_verbatim(self):
++        # Server-side normalization does NOT escape — render-time escape is the
++        # security boundary. The string should round-trip unchanged into storage.
++        payload = "<script>alert(1)</script>"
++        self.assertEqual(parse_and_truncate_tag_string(payload), [payload])
++
++
++class ParseAndTruncateYoutubeTagStringTest(SimpleTestCase):
++    """YouTube-specific cap: total-chars across all tags <= 500."""
++
++    def test_empty_string_returns_empty_list(self):
++        self.assertEqual(parse_and_truncate_youtube_tag_string(""), [])
++
++    def test_caps_each_tag_at_yt_length(self):
++        long_tag = "y" * (MAX_YT_TAG_LENGTH + 10)
++        out = parse_and_truncate_youtube_tag_string(long_tag)
++        self.assertEqual(out, ["y" * MAX_YT_TAG_LENGTH])
++
++    def test_caps_total_chars(self):
++        # 11 tags of MAX_YT_TAG_LENGTH chars each = 11*50 + 10 delimiters = 560 > 500
++        # Should truncate to fit within MAX_YT_TAGS_TOTAL_CHARS
++        tag = "z" * MAX_YT_TAG_LENGTH
++        raw = ",".join(f"{tag}{i}" for i in range(20))
++        out = parse_and_truncate_youtube_tag_string(raw)
++        # Each output tag is 50 chars (since YT cap clips to 50)
++        # Delimiter cost = len(out) - 1 (between tags)
++        total_chars = sum(len(t) for t in out) + max(0, len(out) - 1)
++        self.assertLessEqual(total_chars, MAX_YT_TAGS_TOTAL_CHARS)
++
++    def test_dedupes(self):
++        self.assertEqual(parse_and_truncate_youtube_tag_string("a, a, b, a"), ["a", "b"])
++
++    def test_strips_whitespace(self):
++        self.assertEqual(parse_and_truncate_youtube_tag_string("  a  ,  b  "), ["a", "b"])
++
++
++class IsSafeUrlTest(SimpleTestCase):
++    """SSRF guard: reject non-http(s) and private/reserved IPs."""
++
++    def test_rejects_file_scheme(self):
++        self.assertFalse(is_safe_url("file:///etc/passwd"))
++
++    def test_rejects_gopher_scheme(self):
++        self.assertFalse(is_safe_url("gopher://example.com/"))
++
++    def test_rejects_javascript_scheme(self):
++        self.assertFalse(is_safe_url("javascript:alert(1)"))
++
++    def test_rejects_empty_hostname(self):
++        self.assertFalse(is_safe_url("http:///path"))
++
++    def test_rejects_malformed(self):
++        self.assertFalse(is_safe_url("not a url"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_loopback_ipv4(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("127.0.0.1")
++        self.assertFalse(is_safe_url("http://localhost/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_loopback_ipv6(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("::1")
++        self.assertFalse(is_safe_url("http://ip6-localhost/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_private_10(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("10.0.0.5")
++        self.assertFalse(is_safe_url("http://internal.example.com/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_link_local_metadata(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("169.254.169.254")
++        self.assertFalse(is_safe_url("http://metadata.example.com/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_private_172(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("172.16.5.5")
++        self.assertFalse(is_safe_url("http://internal.example.com/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_private_192(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("192.168.1.1")
++        self.assertFalse(is_safe_url("http://router.example.com/"))
++
++    @patch("socket.getaddrinfo")
++    def test_rejects_dns_rebind_with_any_private_address(self, mock_getaddrinfo):
++        # Hostname resolves to BOTH a public and a private IP; must reject.
++        mock_getaddrinfo.return_value = [
++            (0, 0, 0, "", ("8.8.8.8", 0)),
++            (0, 0, 0, "", ("10.0.0.1", 0)),
++        ]
++        self.assertFalse(is_safe_url("http://malicious-rebind.example.com/"))
++
++    @patch("socket.getaddrinfo")
++    def test_accepts_public_https(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("8.8.8.8")
++        self.assertTrue(is_safe_url("https://example.com/feed.xml"))
++
++    @patch("socket.getaddrinfo")
++    def test_accepts_public_http(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = _fake_addrinfo("93.184.216.34")
++        self.assertTrue(is_safe_url("http://example.com/"))
+diff --git a/apps/common/validators.py b/apps/common/validators.py
+index de7e23c8..0634683e 100644
+--- a/apps/common/validators.py
++++ b/apps/common/validators.py
+@@ -4,15 +4,25 @@
+ import socket
+ from urllib.parse import urlparse
+ 
++MAX_TAGS = 25
++MAX_TAG_LENGTH = 100
++
++MAX_YT_TAGS_TOTAL_CHARS = 500
++MAX_YT_TAG_LENGTH = 50
++
+ 
+ def is_safe_url(url: str) -> bool:
+-    """Validate that a URL does not resolve to a private/reserved IP (SSRF protection).
++    """Validate that a URL is http(s) and does not resolve to a private/reserved IP.
+ 
+-    Returns False for URLs that resolve to private, reserved, loopback, or
+-    link-local IP addresses to prevent server-side request forgery.
++    Returns False for non-http(s) schemes (file://, gopher://, etc.) and for URLs
++    whose hostname resolves to any private, reserved, loopback, or link-local
++    address. Checks every resolved address to defend against DNS responses that
++    include multiple A/AAAA records.
+     """
+     try:
+         parsed = urlparse(url)
++        if parsed.scheme not in ("http", "https"):
++            return False
+         hostname = parsed.hostname
+         if not hostname:
+             return False
+@@ -20,9 +30,84 @@ def is_safe_url(url: str) -> bool:
+         addr_infos = socket.getaddrinfo(hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+         for _family, _, _, _, sockaddr in addr_infos:
+             ip = ipaddress.ip_address(sockaddr[0])
+-            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
++            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                 return False
+ 
+         return True
+     except (socket.gaierror, ValueError, OSError):
+         return False
++
++
++def normalize_tags(raw) -> list[str]:
++    """Strict tag normalization for JSON API endpoints.
++
++    Raises ValueError on malformed input or overflow — caller returns HTTP 400.
++    """
++    if not isinstance(raw, list):
++        raise ValueError("tags must be a list")
++    if len(raw) > MAX_TAGS:
++        raise ValueError(f"too many tags (max {MAX_TAGS})")
++    out: list[str] = []
++    seen: set[str] = set()
++    for t in raw:
++        if not isinstance(t, str):
++            raise ValueError("each tag must be a string")
++        t = t.strip()
++        if not t:
++            continue
++        if len(t) > MAX_TAG_LENGTH:
++            raise ValueError(f"tag too long (max {MAX_TAG_LENGTH} chars)")
++        if t in seen:
++            continue
++        seen.add(t)
++        out.append(t)
++    return out
++
++
++def parse_and_truncate_tag_string(raw: str) -> list[str]:
++    """Lenient tag normalization for HTML form POSTs.
++
++    Splits a comma-separated string, strips whitespace, truncates each tag to
++    MAX_TAG_LENGTH, deduplicates, and caps total count at MAX_TAGS. Excess input
++    is silently dropped — render-time HTML escape is the security boundary.
++    """
++    if not raw:
++        return []
++    parts = [t.strip() for t in raw.split(",") if t.strip()]
++    out: list[str] = []
++    seen: set[str] = set()
++    for t in parts:
++        if len(out) >= MAX_TAGS:
++            break
++        t = t[:MAX_TAG_LENGTH]
++        if t in seen:
++            continue
++        seen.add(t)
++        out.append(t)
++    return out
++
++
++def parse_and_truncate_youtube_tag_string(raw: str) -> list[str]:
++    """YouTube-specific tag normalization for HTML form POSTs.
++
++    YouTube's Data API caps total tag-list characters at 500 (delimiters counted);
++    we cap individual tag length at MAX_YT_TAG_LENGTH as a defensive bound. Excess
++    input is silently dropped.
++    """
++    if not raw:
++        return []
++    parts = [t.strip() for t in raw.split(",") if t.strip()]
++    out: list[str] = []
++    seen: set[str] = set()
++    total = 0
++    for t in parts:
++        t = t[:MAX_YT_TAG_LENGTH]
++        if t in seen:
++            continue
++        cost = len(t) + (1 if out else 0)
++        if total + cost > MAX_YT_TAGS_TOTAL_CHARS:
++            break
++        seen.add(t)
++        out.append(t)
++        total += cost
++    return out
+diff --git a/apps/composer/forms.py b/apps/composer/forms.py
+index 0452c7f8..df830f60 100644
+--- a/apps/composer/forms.py
++++ b/apps/composer/forms.py
+@@ -2,6 +2,8 @@
+ 
+ from django import forms
+ 
++from apps.common.validators import normalize_tags, parse_and_truncate_tag_string
++
+ from .models import ContentCategory, Idea, Post, PostTemplate
+ 
+ 
+@@ -15,8 +17,11 @@ class Meta:
+     def clean_tags(self):
+         tags = self.cleaned_data.get("tags") or []
+         if isinstance(tags, str):
+-            tags = [t.strip() for t in tags.split(",") if t.strip()]
+-        return tags
++            return parse_and_truncate_tag_string(tags)
++        try:
++            return normalize_tags(tags)
++        except ValueError as e:
++            raise forms.ValidationError(str(e)) from e
+ 
+ 
+ class PostForm(forms.ModelForm):
+@@ -74,8 +79,11 @@ class Meta:
+     def clean_tags(self):
+         tags = self.cleaned_data.get("tags") or []
+         if isinstance(tags, str):
+-            tags = [t.strip() for t in tags.split(",") if t.strip()]
+-        return tags
++            return parse_and_truncate_tag_string(tags)
++        try:
++            return normalize_tags(tags)
++        except ValueError as e:
++            raise forms.ValidationError(str(e)) from e
+ 
+ 
+ class ContentCategoryForm(forms.ModelForm):
+diff --git a/apps/composer/tests/test_csv_upload_size.py b/apps/composer/tests/test_csv_upload_size.py
+new file mode 100644
+index 00000000..e48ba7c9
+--- /dev/null
++++ b/apps/composer/tests/test_csv_upload_size.py
+@@ -0,0 +1,52 @@
++"""Tests for the CSV upload size cap (DoS guard)."""
++
++from django.core.files.uploadedfile import SimpleUploadedFile
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.composer.views import MAX_CSV_UPLOAD_BYTES
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.workspaces.models import Workspace
++
++
++class CSVUploadSizeCapTests(TestCase):
++    def setUp(self):
++        self.user = User.objects.create_user(
++            email="owner@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
++        OrgMembership.objects.create(
++            user=self.user,
++            organization=self.org,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user,
++            workspace=self.workspace,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++        self.client.force_login(self.user)
++        self.url = reverse("composer:csv_upload", kwargs={"workspace_id": self.workspace.id})
++
++    def test_oversized_csv_rejected_without_reading(self):
++        # 1 byte over the cap. Use ASCII bytes so the size matches `len`.
++        oversized = b"a" * (MAX_CSV_UPLOAD_BYTES + 1)
++        upload = SimpleUploadedFile("big.csv", oversized, content_type="text/csv")
++        response = self.client.post(self.url, data={"csv_file": upload})
++        self.assertEqual(response.status_code, 200)
++        body = response.content.decode("utf-8")
++        self.assertIn("too large", body)
++
++    def test_under_cap_csv_proceeds_to_mapping(self):
++        small_csv = b"date,platform,caption\n2026-05-01,instagram,Hello\n"
++        upload = SimpleUploadedFile("small.csv", small_csv, content_type="text/csv")
++        response = self.client.post(self.url, data={"csv_file": upload})
++        self.assertEqual(response.status_code, 200)
++        body = response.content.decode("utf-8")
++        self.assertNotIn("too large", body)
+diff --git a/apps/composer/tests/test_save_post_tags.py b/apps/composer/tests/test_save_post_tags.py
+new file mode 100644
+index 00000000..b681a60a
+--- /dev/null
++++ b/apps/composer/tests/test_save_post_tags.py
+@@ -0,0 +1,187 @@
++"""HTTP-level tests for composer save_post and autosave tag normalization.
++
++Verifies that excess tags are silently truncated and that XSS payloads survive
++to storage and render escaped.
++"""
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.common.validators import (
++    MAX_TAG_LENGTH,
++    MAX_TAGS,
++    MAX_YT_TAGS_TOTAL_CHARS,
++)
++from apps.composer.models import PlatformPost, Post
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.social_accounts.models import SocialAccount
++from apps.workspaces.models import Workspace
++
++
++class SavePostTagsTests(TestCase):
++    """POST /workspace/<id>/composer/compose/save/"""
++
++    def setUp(self):
++        self.user = User.objects.create_user(
++            email="owner@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
++        OrgMembership.objects.create(
++            user=self.user,
++            organization=self.org,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user,
++            workspace=self.workspace,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++        self.client.force_login(self.user)
++        self.save_url = reverse("composer:save_post", kwargs={"workspace_id": self.workspace.id})
++
++    def _save_payload(self, tags_value, extra=None):
++        payload = {
++            "action": "save_draft",
++            "title": "Test post",
++            "caption": "body",
++            "tags": tags_value,
++        }
++        if extra:
++            payload.update(extra)
++        return payload
++
++    def test_30_tags_truncated_to_max(self):
++        raw_tags = ",".join(f"tag{i}" for i in range(30))
++        response = self.client.post(self.save_url, data=self._save_payload(raw_tags))
++        self.assertIn(response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++        self.assertIsNotNone(post)
++        self.assertEqual(len(post.tags), MAX_TAGS)
++        self.assertEqual(post.tags[0], "tag0")
++        self.assertEqual(post.tags[-1], f"tag{MAX_TAGS - 1}")
++
++    def test_oversized_tag_truncated(self):
++        long_tag = "x" * (MAX_TAG_LENGTH + 50)
++        response = self.client.post(self.save_url, data=self._save_payload(long_tag))
++        self.assertIn(response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++        self.assertEqual(post.tags, ["x" * MAX_TAG_LENGTH])
++
++    def test_xss_payload_persists_verbatim(self):
++        payload = "<script>alert(1)</script>"
++        response = self.client.post(self.save_url, data=self._save_payload(payload))
++        self.assertIn(response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++        self.assertEqual(post.tags, [payload])
++
++    def test_xss_payload_renders_escaped_in_compose_edit(self):
++        """Post a tag with HTML, then GET the compose edit page; assert escaped."""
++        payload = "<script>alert(1)</script>"
++        save_response = self.client.post(self.save_url, data=self._save_payload(payload))
++        self.assertIn(save_response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++
++        edit_url = reverse(
++            "composer:compose_edit",
++            kwargs={"workspace_id": self.workspace.id, "post_id": post.id},
++        )
++        response = self.client.get(edit_url)
++        self.assertEqual(response.status_code, 200)
++        body = response.content.decode("utf-8")
++        # The page renders the tag list inside an x-data attribute via the
++        # json_attr filter — must be HTML-escaped.
++        self.assertIn("&lt;script&gt;", body)
++        self.assertNotIn(f'"{payload}"', body)
++        self.assertNotIn("<script>alert(1)</script>", body)
++
++    def test_empty_tags_stores_empty_list(self):
++        response = self.client.post(self.save_url, data=self._save_payload(""))
++        self.assertIn(response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++        self.assertEqual(post.tags, [])
++
++    def test_compose_edit_renders_json_script_containers(self):
++        """Follow-up 1: the four |json_script containers must be present in extra_js."""
++        save_response = self.client.post(self.save_url, data=self._save_payload(""))
++        self.assertIn(save_response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++
++        edit_url = reverse(
++            "composer:compose_edit",
++            kwargs={"workspace_id": self.workspace.id, "post_id": post.id},
++        )
++        response = self.client.get(edit_url)
++        self.assertEqual(response.status_code, 200)
++        body = response.content.decode("utf-8")
++        # Each json_script container must render as a <script type="application/json" id="...">
++        self.assertIn('<script id="composer-selected-accounts" type="application/json">', body)
++        self.assertIn('<script id="composer-char-limits" type="application/json">', body)
++        self.assertIn('<script id="composer-platform-extras" type="application/json">', body)
++        self.assertIn('<script id="composer-media-items" type="application/json">', body)
++        # The JS readers must reference the same IDs
++        self.assertIn("document.getElementById('composer-selected-accounts')", body)
++        self.assertIn("document.getElementById('composer-char-limits')", body)
++        self.assertIn("document.getElementById('composer-platform-extras')", body)
++        self.assertIn("document.getElementById('composer-media-items')", body)
++        # No |safe leftovers
++        self.assertNotIn("{{ selected_account_ids|safe }}", body)
++        self.assertNotIn("{{ char_limits_json|safe }}", body)
++        self.assertNotIn("{{ media_items_json|safe }}", body)
++
++
++class YouTubePlatformTagsTests(TestCase):
++    """POST /workspace/<id>/composer/compose/save/ with yt_tags_<acc_id>."""
++
++    def setUp(self):
++        self.user = User.objects.create_user(
++            email="owner@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
++        OrgMembership.objects.create(
++            user=self.user,
++            organization=self.org,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user,
++            workspace=self.workspace,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++        self.youtube_account = SocialAccount.objects.create(
++            workspace=self.workspace,
++            platform="youtube",
++            account_platform_id="yt-1",
++            account_name="Test YT Channel",
++            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
++        )
++        self.client.force_login(self.user)
++        self.save_url = reverse("composer:save_post", kwargs={"workspace_id": self.workspace.id})
++
++    def test_yt_tags_truncated_to_total_chars_cap(self):
++        # 25 tags × 30 chars + 24 delimiters = 774 > 500. Helper must truncate.
++        tags_raw = ",".join("y" * 30 for _ in range(25))
++        payload = {
++            "action": "save_draft",
++            "title": "YT post",
++            "caption": "body",
++            "tags": "",
++            "selected_accounts": str(self.youtube_account.id),
++            f"yt_tags_{self.youtube_account.id}": tags_raw,
++        }
++        response = self.client.post(self.save_url, data=payload)
++        self.assertIn(response.status_code, (200, 204, 302))
++        post = Post.objects.filter(workspace=self.workspace).order_by("-created_at").first()
++        platform_post = PlatformPost.objects.get(post=post, social_account=self.youtube_account)
++        stored_tags = platform_post.platform_extra.get("tags", [])
++        total = sum(len(t) for t in stored_tags) + max(0, len(stored_tags) - 1)
++        self.assertLessEqual(total, MAX_YT_TAGS_TOTAL_CHARS)
++        self.assertGreater(len(stored_tags), 0)
+diff --git a/apps/composer/views.py b/apps/composer/views.py
+index 32ea3004..e5b7019d 100644
+--- a/apps/composer/views.py
++++ b/apps/composer/views.py
+@@ -20,6 +20,11 @@
+ from django.utils.html import strip_tags
+ from django.views.decorators.http import require_GET, require_POST
+ 
++from apps.common.validators import (
++    is_safe_url,
++    parse_and_truncate_tag_string,
++    parse_and_truncate_youtube_tag_string,
++)
+ from apps.members.decorators import require_permission
+ from apps.members.models import WorkspaceMembership
+ from apps.social_accounts.models import SocialAccount
+@@ -40,6 +45,8 @@
+     Tag,
+ )
+ 
++MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
++
+ 
+ def _get_workspace(request, workspace_id):
+     """Resolve workspace and enforce membership check."""
+@@ -88,8 +95,7 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
+ 
+         # Per-platform extras
+         if account.platform == "youtube":
+-            tags_raw = request.POST.get(f"yt_tags_{acc_id}", "")
+-            tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
++            tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
+             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
+             if privacy_status not in ("public", "unlisted", "private"):
+                 privacy_status = "public"
+@@ -444,11 +450,10 @@ def compose(request, workspace_id, post_id=None):
+         "form": form,
+         "social_accounts": social_accounts,
+         "selected_account_ids": [str(aid) for aid in selected_account_ids],
+-        "platform_extras_json": json.dumps(platform_extras),
++        "platform_extras": platform_extras,
+         "media_attachments": media_attachments,
+         "media_items": media_items,
+-        "media_items_json": json.dumps(media_items),
+-        "char_limits_json": json.dumps(char_limits),
++        "char_limits": char_limits,
+         "default_first_comment": default_first_comment,
+         "default_hashtags": json.dumps(default_hashtags),
+         "can_publish": can_publish,
+@@ -843,9 +848,7 @@ def autosave(request, workspace_id, post_id=None):
+     post.first_comment = request.POST.get("first_comment", "")
+     post.internal_notes = request.POST.get("internal_notes", "")
+ 
+-    tags_raw = request.POST.get("tags", "")
+-    if tags_raw:
+-        post.tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
++    post.tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
+ 
+     post.save()
+ 
+@@ -1727,8 +1730,7 @@ def idea_create(request, workspace_id):
+     workspace = _get_workspace(request, workspace_id)
+     title = request.POST.get("title", "").strip()
+     description = request.POST.get("description", "").strip()
+-    tags_raw = request.POST.get("tags", "")
+-    tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
++    tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
+ 
+     if not title:
+         return HttpResponse("Title is required.", status=400)
+@@ -1811,8 +1813,7 @@ def idea_edit(request, workspace_id, idea_id):
+ 
+     idea.title = request.POST.get("title", idea.title).strip()
+     idea.description = request.POST.get("description", idea.description).strip()
+-    tags_raw = request.POST.get("tags", "")
+-    idea.tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
++    idea.tags = parse_and_truncate_tag_string(request.POST.get("tags", ""))
+ 
+     group_id = request.POST.get("group", "").strip()
+     if group_id:
+@@ -2312,6 +2313,12 @@ def csv_upload(request, workspace_id):
+         import io
+ 
+         csv_file = request.FILES["csv_file"]
++        if csv_file.size and csv_file.size > MAX_CSV_UPLOAD_BYTES:
++            return render(
++                request,
++                "composer/csv_import.html",
++                {"workspace": workspace, "error": "CSV file too large (max 5 MB)."},
++            )
+         decoded = csv_file.read().decode("utf-8-sig")
+         reader = csv.reader(io.StringIO(decoded))
+         rows = list(reader)
+@@ -2920,15 +2927,31 @@ def _render_feeds_tab(
+ 
+ def _validate_rss_url(rss_url):
+     """Validate that a URL points to a reachable RSS/Atom XML feed."""
++    if not is_safe_url(rss_url):
++        return False, "Could not reach this URL. Please check the link and try again.", {}
++
+     headers = {
+         "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.1",
+         "User-Agent": "Brightbean RSS Validator/1.0",
+     }
+     try:
+-        response = httpx.get(rss_url, headers=headers, timeout=8.0, follow_redirects=True)
++        response = httpx.get(rss_url, headers=headers, timeout=8.0, follow_redirects=False)
+     except httpx.RequestError:
+         return False, "Could not reach this URL. Please check the link and try again.", {}
+ 
++    # Follow up to 5 redirects, re-validating each Location against is_safe_url
++    # to defend against redirect-based SSRF (e.g. 302 → http://127.0.0.1).
++    for _ in range(5):
++        if response.status_code not in (301, 302, 303, 307, 308):
++            break
++        location = response.headers.get("Location")
++        if not location or not is_safe_url(location):
++            return False, "Could not reach this URL. Please check the link and try again.", {}
++        try:
++            response = httpx.get(location, headers=headers, timeout=8.0, follow_redirects=False)
++        except httpx.RequestError:
++            return False, "Could not reach this URL. Please check the link and try again.", {}
++
+     if response.status_code >= 400:
+         return False, "This URL could not be loaded as a feed.", {}
+ 
+diff --git a/apps/media_library/tests/__init__.py b/apps/media_library/tests/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apps/media_library/tests.py b/apps/media_library/tests/test_models_and_filters.py
+similarity index 88%
+rename from apps/media_library/tests.py
+rename to apps/media_library/tests/test_models_and_filters.py
+index 08c1fe6e..acfa99ff 100644
+--- a/apps/media_library/tests.py
++++ b/apps/media_library/tests/test_models_and_filters.py
+@@ -7,12 +7,8 @@
+ from django.test import SimpleTestCase, TestCase
+ 
+ from apps.common.templatetags.common_extras import json_attr
++from apps.common.validators import MAX_TAG_LENGTH, MAX_TAGS, normalize_tags
+ from apps.media_library.models import MediaAsset
+-from apps.media_library.views import (
+-    MAX_TAG_LENGTH,
+-    MAX_TAGS_PER_ASSET,
+-    _normalize_tags,
+-)
+ 
+ 
+ class MediaAssetModelTest(TestCase):
+@@ -132,27 +128,27 @@ class NormalizeTagsTest(SimpleTestCase):
+ 
+     def test_rejects_non_list(self):
+         with self.assertRaises(ValueError):
+-            _normalize_tags({"foo": "bar"})
++            normalize_tags({"foo": "bar"})
+ 
+     def test_rejects_too_many(self):
+         with self.assertRaises(ValueError):
+-            _normalize_tags(["x"] * (MAX_TAGS_PER_ASSET + 1))
++            normalize_tags(["x"] * (MAX_TAGS + 1))
+ 
+     def test_accepts_at_limit(self):
+-        result = _normalize_tags([f"tag{i}" for i in range(MAX_TAGS_PER_ASSET)])
+-        self.assertEqual(len(result), MAX_TAGS_PER_ASSET)
++        result = normalize_tags([f"tag{i}" for i in range(MAX_TAGS)])
++        self.assertEqual(len(result), MAX_TAGS)
+ 
+     def test_rejects_oversized(self):
+         with self.assertRaises(ValueError):
+-            _normalize_tags(["x" * (MAX_TAG_LENGTH + 1)])
++            normalize_tags(["x" * (MAX_TAG_LENGTH + 1)])
+ 
+     def test_rejects_non_string_element(self):
+         with self.assertRaises(ValueError):
+-            _normalize_tags([123])
++            normalize_tags([123])
+ 
+     def test_strips_whitespace_and_dedupes(self):
+-        self.assertEqual(_normalize_tags(["  a  ", "a", "b", "", "   "]), ["a", "b"])
++        self.assertEqual(normalize_tags(["  a  ", "a", "b", "", "   "]), ["a", "b"])
+ 
+     def test_preserves_malicious_payload_verbatim(self):
+         payload = "<script>alert(1)</script>"
+-        self.assertEqual(_normalize_tags([payload]), [payload])
++        self.assertEqual(normalize_tags([payload]), [payload])
+diff --git a/apps/media_library/tests/test_tag_endpoints.py b/apps/media_library/tests/test_tag_endpoints.py
+new file mode 100644
+index 00000000..1a2435bb
+--- /dev/null
++++ b/apps/media_library/tests/test_tag_endpoints.py
+@@ -0,0 +1,149 @@
++"""HTTP-level tests for the media library tag-update endpoint.
++
++Covers the asset_tags POST contract: validation, overflow rejection, dedup,
++cross-workspace isolation, and end-to-end XSS round-trip.
++"""
++
++import json
++
++from django.test import TestCase
++from django.urls import reverse
++from django.utils import timezone
++
++from apps.accounts.models import User
++from apps.common.validators import MAX_TAG_LENGTH, MAX_TAGS
++from apps.media_library.models import MediaAsset
++from apps.members.models import OrgMembership, WorkspaceMembership
++from apps.organizations.models import Organization
++from apps.workspaces.models import Workspace
++
++
++class AssetTagEndpointTests(TestCase):
++    """POST /workspace/<id>/media/<asset_id>/tags/"""
++
++    def setUp(self):
++        self.user = User.objects.create_user(
++            email="owner@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        self.org = Organization.objects.create(name="Test Org")
++        self.workspace = Workspace.objects.create(organization=self.org, name="Test Workspace")
++        OrgMembership.objects.create(
++            user=self.user,
++            organization=self.org,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        WorkspaceMembership.objects.create(
++            user=self.user,
++            workspace=self.workspace,
++            workspace_role=WorkspaceMembership.WorkspaceRole.OWNER,
++        )
++        self.asset = MediaAsset.objects.create(
++            organization=self.org,
++            workspace=self.workspace,
++            uploaded_by=self.user,
++            file="media_library/tests/asset.png",
++            filename="asset.png",
++            media_type=MediaAsset.MediaType.IMAGE,
++            mime_type="image/png",
++            file_size=128,
++            source="upload",
++        )
++        self.client.force_login(self.user)
++        self.url = reverse(
++            "media_library:asset_tags",
++            kwargs={"workspace_id": self.workspace.id, "asset_id": self.asset.id},
++        )
++
++    def _post_json(self, body):
++        return self.client.post(self.url, data=json.dumps(body), content_type="application/json")
++
++    def test_happy_path_persists_tags(self):
++        response = self._post_json(["alpha", "beta", "gamma"])
++        self.assertEqual(response.status_code, 200)
++        self.asset.refresh_from_db()
++        self.assertEqual(self.asset.tags, ["alpha", "beta", "gamma"])
++
++    def test_dedupes_tags(self):
++        response = self._post_json(["alpha", "alpha", "beta", "alpha"])
++        self.assertEqual(response.status_code, 200)
++        self.asset.refresh_from_db()
++        self.assertEqual(self.asset.tags, ["alpha", "beta"])
++
++    def test_strips_whitespace(self):
++        self._post_json(["  alpha  ", "beta"])
++        self.asset.refresh_from_db()
++        self.assertEqual(self.asset.tags, ["alpha", "beta"])
++
++    def test_rejects_over_max_tags(self):
++        response = self._post_json([f"t{i}" for i in range(MAX_TAGS + 1)])
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("too many tags", response.json()["error"])
++
++    def test_rejects_oversized_tag(self):
++        response = self._post_json(["x" * (MAX_TAG_LENGTH + 1)])
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("too long", response.json()["error"])
++
++    def test_rejects_non_list_body(self):
++        response = self._post_json({"tags": ["alpha"]})
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("must be a list", response.json()["error"])
++
++    def test_rejects_non_string_element(self):
++        response = self._post_json(["alpha", 123, "beta"])
++        self.assertEqual(response.status_code, 400)
++        self.assertIn("must be a string", response.json()["error"])
++
++    def test_unauthenticated_request_redirects(self):
++        self.client.logout()
++        response = self._post_json(["alpha"])
++        self.assertEqual(response.status_code, 302)
++        self.assertIn("/login", response.url)
++
++    def test_cross_workspace_user_gets_403(self):
++        """User not a member of this workspace must not reach the view at all.
++
++        The RBAC middleware rejects with PermissionDenied (403) before the
++        view body executes, so the asset's existence is not leaked.
++        """
++        other_user = User.objects.create_user(
++            email="outsider@example.com",
++            password="testpass123",
++            tos_accepted_at=timezone.now(),
++        )
++        other_org = Organization.objects.create(name="Other Org")
++        OrgMembership.objects.create(
++            user=other_user,
++            organization=other_org,
++            org_role=OrgMembership.OrgRole.OWNER,
++        )
++        self.client.force_login(other_user)
++        response = self._post_json(["alpha"])
++        self.assertEqual(response.status_code, 403)
++        # Existing tags must not have changed
++        self.asset.refresh_from_db()
++        self.assertEqual(self.asset.tags, [])
++
++    def test_xss_payload_persists_verbatim_and_renders_escaped(self):
++        """A tag containing HTML must round-trip through save → render escaped."""
++        payload = "<script>alert(1)</script>"
++        response = self._post_json([payload])
++        self.assertEqual(response.status_code, 200)
++        self.asset.refresh_from_db()
++        # Server-side: the string is stored verbatim — escape happens at render.
++        self.assertEqual(self.asset.tags, [payload])
++
++        # Now render the tag list partial via the HTMX response path and assert
++        # the rendered HTML contains escaped output, not raw <script>.
++        response = self.client.post(
++            self.url,
++            data=json.dumps([payload]),
++            content_type="application/json",
++            HTTP_HX_REQUEST="true",
++        )
++        self.assertEqual(response.status_code, 200)
++        rendered = response.content.decode("utf-8")
++        self.assertIn("&lt;script&gt;", rendered)
++        self.assertNotIn("<script>alert(1)</script>", rendered)
+diff --git a/apps/media_library/views.py b/apps/media_library/views.py
+index 17c076bc..37583867 100644
+--- a/apps/media_library/views.py
++++ b/apps/media_library/views.py
+@@ -10,6 +10,7 @@
+ from django.shortcuts import get_object_or_404, redirect, render
+ from django.views.decorators.http import require_GET, require_http_methods, require_POST
+ 
++from apps.common.validators import normalize_tags
+ from apps.members.decorators import require_org_role, require_permission
+ 
+ from .models import MediaAsset, MediaFolder
+@@ -32,36 +33,6 @@ def _get_workspace_or_404(request, workspace_id):
+     return request.workspace
+ 
+ 
+-MAX_TAGS_PER_ASSET = 25
+-MAX_TAG_LENGTH = 100
+-
+-
+-def _normalize_tags(raw) -> list[str]:
+-    """Validate and normalize a tag list from request input.
+-
+-    Raises ValueError on malformed input — caller should return HTTP 400.
+-    """
+-    if not isinstance(raw, list):
+-        raise ValueError("tags must be a list")
+-    if len(raw) > MAX_TAGS_PER_ASSET:
+-        raise ValueError(f"too many tags (max {MAX_TAGS_PER_ASSET})")
+-    out: list[str] = []
+-    seen: set[str] = set()
+-    for t in raw:
+-        if not isinstance(t, str):
+-            raise ValueError("each tag must be a string")
+-        t = t.strip()
+-        if not t:
+-            continue
+-        if len(t) > MAX_TAG_LENGTH:
+-            raise ValueError(f"tag too long (max {MAX_TAG_LENGTH} chars)")
+-        if t in seen:
+-            continue
+-        seen.add(t)
+-        out.append(t)
+-    return out
+-
+-
+ # ──────────────────────────────────────────────────────────────
+ #  Library Index
+ # ──────────────────────────────────────────────────────────────
+@@ -427,7 +398,7 @@ def asset_update_tags(request, workspace_id, asset_id):
+ 
+     try:
+         body = json.loads(request.body) if request.content_type == "application/json" else request.POST.getlist("tags")
+-        asset.tags = _normalize_tags(body)
++        asset.tags = normalize_tags(body)
+     except (json.JSONDecodeError, ValueError) as e:
+         return JsonResponse({"error": str(e)}, status=400)
+     asset.save(update_fields=["tags", "updated_at"])
+@@ -1089,7 +1060,7 @@ def shared_asset_update_tags(request, asset_id):
+ 
+     try:
+         body = json.loads(request.body) if request.content_type == "application/json" else request.POST.getlist("tags")
+-        asset.tags = _normalize_tags(body)
++        asset.tags = normalize_tags(body)
+     except (json.JSONDecodeError, ValueError) as e:
+         return JsonResponse({"error": str(e)}, status=400)
+     asset.save(update_fields=["tags", "updated_at"])
+diff --git a/apps/notifications/engine.py b/apps/notifications/engine.py
+index db318f1d..a4e029c3 100644
+--- a/apps/notifications/engine.py
++++ b/apps/notifications/engine.py
+@@ -260,10 +260,20 @@ def _dispatch_email(delivery: NotificationDelivery) -> None:
+ 
+ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+     """Send notification via webhook (HTTP POST with HMAC-SHA256 signature)."""
+-    import urllib.request
++    import httpx
++
++    from apps.common.validators import is_safe_url
+ 
+     notification = delivery.notification
+ 
++    webhook_url = notification.data.get("webhook_url")
++    if not webhook_url:
++        logger.info("No webhook_url in notification data, skipping webhook delivery")
++        return
++
++    if not is_safe_url(webhook_url):
++        raise RuntimeError("Webhook URL rejected: must be a public http(s) endpoint")
++
+     payload = json.dumps(
+         {
+             "event_type": notification.event_type,
+@@ -276,11 +286,6 @@ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+         default=str,
+     ).encode("utf-8")
+ 
+-    webhook_url = notification.data.get("webhook_url")
+-    if not webhook_url:
+-        logger.info("No webhook_url in notification data, skipping webhook delivery")
+-        return
+-
+     webhook_secret = getattr(settings, "WEBHOOK_SECRET", settings.SECRET_KEY)
+     signature = hmac.new(
+         webhook_secret.encode("utf-8"),
+@@ -288,20 +293,15 @@ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
+         hashlib.sha256,
+     ).hexdigest()
+ 
+-    req = urllib.request.Request(
+-        webhook_url,
+-        data=payload,
+-        headers={
+-            "Content-Type": "application/json",
+-            "X-Signature-256": f"sha256={signature}",
+-            "X-Event-Type": notification.event_type,
+-        },
+-        method="POST",
+-    )
++    headers = {
++        "Content-Type": "application/json",
++        "X-Signature-256": f"sha256={signature}",
++        "X-Event-Type": notification.event_type,
++    }
+ 
+-    with urllib.request.urlopen(req, timeout=10) as resp:
+-        if resp.status >= 400:
+-            raise RuntimeError(f"Webhook returned HTTP {resp.status}")
++    response = httpx.post(webhook_url, content=payload, headers=headers, timeout=10.0, follow_redirects=False)
++    if response.status_code >= 400:
++        raise RuntimeError(f"Webhook returned HTTP {response.status_code}")
+ 
+ 
+ def retry_failed_deliveries() -> int:
+diff --git a/apps/notifications/tests.py b/apps/notifications/tests.py
+index 08f71267..b07dbda0 100644
+--- a/apps/notifications/tests.py
++++ b/apps/notifications/tests.py
+@@ -1,4 +1,5 @@
+ import datetime
++from unittest.mock import Mock, patch
+ 
+ import pytest
+ from django.utils import timezone
+@@ -232,3 +233,72 @@ def test_preferences_page_post(self, client, user):
+             channel=Channel.IN_APP,
+         )
+         assert pref.is_enabled is True
++
++
++@pytest.mark.django_db
++class TestWebhookDispatchSSRFGuard:
++    """The webhook dispatcher must reject private / loopback URLs.
++
++    Regression: pre-fix the code POSTed via urllib.request.urlopen with no URL
++    validation, so a notification stored with webhook_url=http://127.0.0.1:6379/
++    would hit local services.
++    """
++
++    def _build_delivery(self, user, webhook_url):
++        notification = Notification.objects.create(
++            user=user,
++            event_type=EventType.POST_APPROVED,
++            title="t",
++            body="b",
++            data={"webhook_url": webhook_url},
++        )
++        return NotificationDelivery.objects.create(
++            notification=notification,
++            channel=Channel.WEBHOOK,
++            status=DeliveryStatus.PENDING,
++        )
++
++    def test_rejects_loopback_url(self, user):
++        from apps.notifications.engine import _dispatch_webhook
++
++        with (
++            patch("httpx.post") as httpx_post,
++            patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("127.0.0.1", 0))]),
++        ):
++            delivery = self._build_delivery(user, "http://localhost/")
++            with pytest.raises(RuntimeError, match="rejected"):
++                _dispatch_webhook(delivery)
++            httpx_post.assert_not_called()
++
++    def test_rejects_private_ip(self, user):
++        from apps.notifications.engine import _dispatch_webhook
++
++        with (
++            patch("httpx.post") as httpx_post,
++            patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("10.0.0.5", 0))]),
++        ):
++            delivery = self._build_delivery(user, "http://internal-svc.example.com/")
++            with pytest.raises(RuntimeError, match="rejected"):
++                _dispatch_webhook(delivery)
++            httpx_post.assert_not_called()
++
++    def test_rejects_file_scheme(self, user):
++        from apps.notifications.engine import _dispatch_webhook
++
++        with patch("httpx.post") as httpx_post:
++            delivery = self._build_delivery(user, "file:///etc/passwd")
++            with pytest.raises(RuntimeError, match="rejected"):
++                _dispatch_webhook(delivery)
++            httpx_post.assert_not_called()
++
++    def test_accepts_public_url(self, user):
++        from apps.notifications.engine import _dispatch_webhook
++
++        mock_response = Mock(status_code=200)
++        with (
++            patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("8.8.8.8", 0))]),
++            patch("httpx.post", return_value=mock_response) as httpx_post,
++        ):
++            delivery = self._build_delivery(user, "https://hooks.example.com/abc")
++            _dispatch_webhook(delivery)
++            httpx_post.assert_called_once()
+diff --git a/apps/onboarding/checklist.py b/apps/onboarding/checklist.py
+index a893e0c6..65cf2446 100644
+--- a/apps/onboarding/checklist.py
++++ b/apps/onboarding/checklist.py
+@@ -11,6 +11,10 @@ def get_checklist_items(workspace):
+     """Return a list of checklist item dicts with dynamic completion status.
+ 
+     Each item has: key, title, description, completed (bool), url, icon_color, icon_svg
++
++    SECURITY: `icon_svg` is rendered with `|safe` in the checklist template.
++    It MUST remain a server-side constant string. Never populate it from user
++    input, model fields, or any other untrusted source.
+     """
+     from apps.composer.models import Idea, Post
+     from apps.members.models import WorkspaceMembership
+diff --git a/templates/composer/compose.html b/templates/composer/compose.html
+index 5f6999be..6aae0680 100644
+--- a/templates/composer/compose.html
++++ b/templates/composer/compose.html
+@@ -1365,17 +1365,21 @@ <h3 class="text-base font-semibold text-stone-900 mb-1">Delete post?</h3>
+ {% endblock %}
+ 
+ {% block extra_js %}
++{{ selected_account_ids|json_script:"composer-selected-accounts" }}
++{{ char_limits|json_script:"composer-char-limits" }}
++{{ platform_extras|json_script:"composer-platform-extras" }}
++{{ media_items|json_script:"composer-media-items" }}
+ <script nonce="{{ request.csp_nonce }}">
+ function composerApp() {
+     return {
+         // State
+         title: '{{ form.title.value|default:""|escapejs }}',
+         caption: '{{ form.caption.value|default:""|escapejs }}',
+-        selectedAccounts: {{ selected_account_ids|safe }},
+-        charLimits: {{ char_limits_json|safe }},
++        selectedAccounts: JSON.parse(document.getElementById('composer-selected-accounts').textContent),
++        charLimits: JSON.parse(document.getElementById('composer-char-limits').textContent),
+         overrides: {},
+         advancedOpen: {},
+-        platformExtras: {{ platform_extras_json|default:"{}"|safe }},
++        platformExtras: JSON.parse(document.getElementById('composer-platform-extras').textContent) || {},
+         showMediaPicker: false,
+         showThumbnailPicker: false,
+         thumbnailPickerAccId: null,
+@@ -1386,7 +1390,7 @@ <h3 class="text-base font-semibold text-stone-900 mb-1">Delete post?</h3>
+         lastSaved: null,
+         previewTimer: null,
+         autosavedPostId: '{{ post.id|default:"" }}',
+-        mediaItems: {{ media_items_json|safe }},
++        mediaItems: JSON.parse(document.getElementById('composer-media-items').textContent),
+ 
+         // Computed-like getters for title field visibility
+         get anyPlatformNeedsTitle() {
